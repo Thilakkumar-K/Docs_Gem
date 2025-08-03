@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced FastAPI Backend with RAG for Document Question Answering
-Uses FAISS for vector search and Gemini for generation
+Uses FAISS for vector search, Gemini for generation, and PostgreSQL for persistence
 Production-ready with intelligent chunking and semantic retrieval
 """
 
@@ -15,12 +15,38 @@ import httpx
 import asyncio
 import logging
 import os
-from dotenv import load_dotenv
 import time
 import hashlib
 import json
 import uuid
 from pathlib import Path
+from datetime import datetime
+
+from pydantic import BaseModel
+from typing import List
+
+# Database imports
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+from models import Document, Question
+from database_config import engine, init_database, close_database, check_database_health, get_db_info
+from db import get_db
+
+
+class ChunkResult(BaseModel):
+    chunk_id: str
+    similarity_score: float
+    rank: int
+    text: str
+    char_count: int
+
+
+class ChunkSearchResponse(BaseModel):
+    document_id: str
+    query: str
+    results_count: int
+    chunks: List[ChunkResult]
+
 
 # Document processing imports
 import PyPDF2
@@ -52,9 +78,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="RAG-Powered Document QA API",
-    description="Advanced Document Question Answering with Retrieval-Augmented Generation",
-    version="2.0.0",
+    title="RAG-Powered Document QA API with PostgreSQL",
+    description="Advanced Document Question Answering with Retrieval-Augmented Generation and PostgreSQL persistence",
+    version="2.1.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -68,24 +94,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-load_dotenv()
 # Security
 security = HTTPBearer()
-VALID_TOKEN = os.getenv("VALID_TOKEN")
+VALID_TOKEN = "5b6105937b7cc769e46557d6241353e800d99cb57def59fd962d1d6ea8fcf736"
 
 # Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = "AIzaSyAcgXOeBXAjVlLw5YfXgxz0WE6ECRFz2v4"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Lightweight but effective
-CHUNK_SIZE = 2000  # Characters per chunk
+CHUNK_SIZE = 1000  # Characters per chunk
 CHUNK_OVERLAP = 200  # Overlap between chunks
-TOP_K_RETRIEVAL = 10  # Number of chunks to retrieve
+TOP_K_RETRIEVAL = 5  # Number of chunks to retrieve
 MAX_CONTEXT_LENGTH = 10000  # Max context for Gemini
-
-# Validate they exist
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is required")
-if not VALID_TOKEN:
-    raise ValueError("VALID_TOKEN environment variable is required")
 
 # Initialize directories
 UPLOAD_DIR = Path("uploads")
@@ -123,17 +142,37 @@ class DocumentUploadResponse(BaseModel):
     status: str
     chunks_created: int
     message: str
+    database_id: Optional[int] = None
 
 
 class DocumentQAResponse(BaseModel):
     answers: List[Dict[str, Any]]
     document_id: str
+    database_id: Optional[int] = None
     retrieval_info: Optional[Dict[str, Any]] = None
 
 
 class ErrorResponse(BaseModel):
     error: str
     details: Optional[str] = None
+
+
+class DocumentListItem(BaseModel):
+    id: int
+    document_id: str
+    url: Optional[str] = None
+    filename: Optional[str] = None
+    chunks_count: int
+    created_at: datetime
+    questions_count: int
+    status: str
+
+
+class QuestionHistoryItem(BaseModel):
+    id: int
+    question_text: str
+    answer_text: str
+    created_at: datetime
 
 
 # Authentication dependency
@@ -382,7 +421,7 @@ class DocumentProcessor:
 
 
 class VectorStore:
-    """FAISS-based vector store for document embeddings"""
+    """FAISS-based vector store for document embeddings with PostgreSQL integration"""
 
     def __init__(self):
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -686,6 +725,126 @@ ANSWER:"""
         return min(confidence, 1.0)
 
 
+# Database service functions
+class DatabaseService:
+    """Service for database operations"""
+
+    @staticmethod
+    async def save_document(db: AsyncSession, document_id: str, url: str = None, content: str = None,
+                            filename: str = None) -> Document:
+        """Save document to database"""
+        try:
+            document = Document(
+                document_id=document_id,
+                url=url,
+                content=content,
+                filename=filename,
+                created_at=datetime.utcnow()
+            )
+            db.add(document)
+            await db.commit()
+            await db.refresh(document)
+            logger.info(f"Saved document to database with ID: {document.id}")
+            return document
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error saving document to database: {e}")
+            raise
+
+    @staticmethod
+    async def get_document_by_document_id(db: AsyncSession, document_id: str) -> Optional[Document]:
+        """Get document by document_id"""
+        try:
+            result = await db.execute(select(Document).where(Document.document_id == document_id))
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Error getting document from database: {e}")
+            return None
+
+    @staticmethod
+    async def save_question_answer(db: AsyncSession, document_id: int, question_text: str, answer_text: str,
+                                   confidence_score: float = None, chunks_used: int = None) -> Question:
+        """Save question and answer to database"""
+        try:
+            question = Question(
+                document_id=document_id,
+                question_text=question_text,
+                answer_text=answer_text,
+                confidence_score=confidence_score,
+                chunks_used=chunks_used,
+                created_at=datetime.utcnow()
+            )
+            db.add(question)
+            await db.commit()
+            await db.refresh(question)
+            return question
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error saving question/answer to database: {e}")
+            raise
+
+    @staticmethod
+    async def get_all_documents(db: AsyncSession) -> List[Dict[str, Any]]:
+        """Get all documents with their question counts"""
+        try:
+            # This would be better with a proper join query, but for simplicity:
+            documents = await db.execute(select(Document))
+            documents = documents.scalars().all()
+
+            result = []
+            for doc in documents:
+                questions = await db.execute(select(Question).where(Question.document_id == doc.id))
+                questions_count = len(questions.scalars().all())
+
+                # Get chunks count from vector store
+                chunks_count = 0
+                if doc.document_id in vector_store.chunks:
+                    chunks_count = len(vector_store.chunks[doc.document_id])
+
+                result.append({
+                    "id": doc.id,
+                    "document_id": doc.document_id,
+                    "url": doc.url,
+                    "filename": doc.filename,
+                    "created_at": doc.created_at,
+                    "questions_count": questions_count,
+                    "chunks_count": chunks_count,
+                    "status": "loaded" if doc.document_id in vector_store.indexes else "stored"
+                })
+
+            return result
+        except Exception as e:
+            logger.error(f"Error getting documents from database: {e}")
+            return []
+
+    @staticmethod
+    async def get_document_questions(db: AsyncSession, document_id: int) -> List[Question]:
+        """Get all questions for a document"""
+        try:
+            result = await db.execute(select(Question).where(Question.document_id == document_id))
+            return result.scalars().all()
+        except Exception as e:
+            logger.error(f"Error getting questions from database: {e}")
+            return []
+
+    @staticmethod
+    async def delete_document_and_questions(db: AsyncSession, document_id: int):
+        """Delete document and all associated questions"""
+        try:
+            # Delete questions first
+            await db.execute(delete(Question).where(Question.document_id == document_id))
+
+            # Delete document
+            await db.execute(delete(Document).where(Document.id == document_id))
+
+            await db.commit()
+            logger.info(f"Deleted document {document_id} and associated questions from database")
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error deleting document from database: {e}")
+            raise
+
+
 # Initialize services
 vector_store = VectorStore()
 rag_llm_service = RAGLLMService()
@@ -694,16 +853,21 @@ rag_llm_service = RAGLLMService()
 # API Routes
 @app.get("/api/v1/health")
 async def health_check():
-    """Enhanced health check"""
+    """Enhanced health check with database status"""
+    db_status = await check_database_health()
+    db_info = await get_db_info() if db_status else {"status": "disconnected"}
+
     return {
-        "status": "healthy",
+        "status": "healthy" if db_status else "degraded",
         "timestamp": time.time(),
         "services": {
             "gemini_available": rag_llm_service.model is not None,
             "gemini_model": rag_llm_service.model_name,
             "embedding_model": EMBEDDING_MODEL_NAME,
-            "vector_store_ready": True
+            "vector_store_ready": True,
+            "database_connected": db_status
         },
+        "database_info": db_info,
         "configuration": {
             "chunk_size": CHUNK_SIZE,
             "chunk_overlap": CHUNK_OVERLAP,
@@ -716,14 +880,15 @@ async def health_check():
 @app.post("/api/v1/documents/upload")
 async def upload_document(
         file: UploadFile = File(...),
-        token: str = Depends(verify_token)
+        token: str = Depends(verify_token),
+        db: AsyncSession = Depends(get_db)
 ):
-    """Upload and process document for RAG"""
+    """Upload and process document for RAG with database persistence"""
     try:
         # Generate document ID
         document_id = str(uuid.uuid4())
 
-        # Save uploaded file
+        # Save uploaded file temporarily
         file_path = UPLOAD_DIR / f"{document_id}_{file.filename}"
 
         with open(file_path, "wb") as buffer:
@@ -750,6 +915,11 @@ async def upload_document(
         # Create embeddings and vector index
         chunks_created = await vector_store.create_embeddings(document_id, chunks)
 
+        # Save to database
+        db_document = await DatabaseService.save_document(
+            db, document_id, filename=file.filename, content=text[:10000]  # Store first 10k chars
+        )
+
         # Clean up uploaded file
         file_path.unlink()
 
@@ -758,7 +928,8 @@ async def upload_document(
             filename=file.filename,
             status="processed",
             chunks_created=chunks_created,
-            message=f"Document processed successfully with {chunks_created} chunks"
+            database_id=db_document.id,
+            message=f"Document processed successfully with {chunks_created} chunks and saved to database"
         )
 
     except Exception as e:
@@ -781,13 +952,15 @@ async def upload_document(
 )
 async def process_document_qa_rag(
         request: DocumentQARequest,
-        token: str = Depends(verify_token)
+        token: str = Depends(verify_token),
+        db: AsyncSession = Depends(get_db)
 ):
     """
-    Enhanced RAG-powered document QA endpoint
+    Enhanced RAG-powered document QA endpoint with database persistence
     """
     try:
         document_id = None
+        db_document = None
 
         # Process document if URL provided
         if request.documents and not request.document_id:
@@ -796,7 +969,16 @@ async def process_document_qa_rag(
             # Extract text and get document ID
             text, document_id = await DocumentProcessor.process_document(request.documents)
 
-            # Check if we already have this document processed
+            # Check if document exists in database
+            db_document = await DatabaseService.get_document_by_document_id(db, document_id)
+
+            if not db_document:
+                # Save new document to database
+                db_document = await DatabaseService.save_document(
+                    db, document_id, url=request.documents, content=text[:10000]  # Store first 10k chars
+                )
+
+            # Check if we already have this document processed in vector store
             if document_id not in vector_store.indexes:
                 # Create intelligent chunks
                 chunks = DocumentProcessor.intelligent_chunking(text)
@@ -810,6 +992,14 @@ async def process_document_qa_rag(
         elif request.document_id:
             document_id = request.document_id
             logger.info(f"Using pre-processed document: {document_id}")
+
+            # Get document from database
+            db_document = await DatabaseService.get_document_by_document_id(db, document_id)
+            if not db_document:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Document {document_id} not found in database"
+                )
 
         else:
             raise HTTPException(
@@ -844,6 +1034,20 @@ async def process_document_qa_rag(
             answer_data["question"] = question
             answers.append(answer_data)
 
+            # Save question and answer to database
+            if db_document:
+                try:
+                    await DatabaseService.save_question_answer(
+                        db,
+                        db_document.id,
+                        question,
+                        answer_data["answer"],
+                        answer_data.get("confidence", 0.0),
+                        answer_data.get("chunks_retrieved", 0)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to save question/answer to database: {e}")
+
             # Update stats
             total_chunks += answer_data.get("chunks_retrieved", 0)
             total_confidence += answer_data.get("confidence", 0.0)
@@ -860,6 +1064,7 @@ async def process_document_qa_rag(
         return DocumentQAResponse(
             answers=answers,
             document_id=document_id,
+            database_id=db_document.id if db_document else None,
             retrieval_info=retrieval_stats
         )
 
@@ -916,53 +1121,79 @@ async def get_document_chunks(
         )
 
 
-@app.post("/api/v1/documents/{document_id}/search")
+@app.post("/api/v1/documents/{document_id}/search", response_model=ChunkSearchResponse)
 async def search_document_chunks(
         document_id: str,
         query: str,
         top_k: int = 5,
         token: str = Depends(verify_token)
 ):
-    """Search for relevant chunks in a specific document"""
-    try:
-        relevant_chunks = await vector_store.search_similar_chunks(
-            document_id, query, min(top_k, 20)  # Limit to max 20
-        )
+    """
+    Search for relevant chunks in a specific document based on semantic similarity.
 
-        return {
-            "document_id": document_id,
-            "query": query,
-            "results_count": len(relevant_chunks),
-            "chunks": [
-                {
-                    "chunk_id": chunk["chunk_id"],
-                    "similarity_score": chunk["similarity_score"],
-                    "rank": chunk["rank"],
-                    "text": chunk["text"],
-                    "char_count": chunk["char_count"]
-                }
-                for chunk in relevant_chunks
-            ]
-        }
+    Parameters:
+    - document_id: ID of the document to search within
+    - query: Natural language query to match chunks
+    - top_k: Maximum number of results to return (default 5, max 20)
+    """
+    try:
+        logger.info(f"🔍 Searching document {document_id} for query: '{query}' (top_k={top_k})")
+
+        top_k = min(max(top_k, 1), 20)  # Enforce range 1–20
+
+        relevant_chunks = await vector_store.search_similar_chunks(document_id, query, top_k)
+
+        formatted_chunks = [
+            ChunkResult(
+                chunk_id=chunk["chunk_id"],
+                similarity_score=chunk["similarity_score"],
+                rank=chunk["rank"],
+                text=chunk["text"],
+                char_count=chunk["char_count"]
+            )
+            for chunk in relevant_chunks
+        ]
+
+        logger.info(f"✅ Found {len(formatted_chunks)} relevant chunks")
+
+        return ChunkSearchResponse(
+            document_id=document_id,
+            query=query,
+            results_count=len(formatted_chunks),
+            chunks=formatted_chunks
+        )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error searching chunks: {e}")
+        logger.error(f"💥 Error searching chunks: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to search chunks: {str(e)}"
         )
 
 
-@app.delete("/api/v1/documents/{document_id}")
+@app.delete("/api/v1/documents/{db_document_id}")
 async def delete_document(
-        document_id: str,
-        token: str = Depends(verify_token)
+        db_document_id: int,
+        token: str = Depends(verify_token),
+        db: AsyncSession = Depends(get_db)
 ):
-    """Delete a document and its associated data"""
+    """Delete a document and its associated data from both database and vector store"""
     try:
-        # Remove from memory
+        # Get document from database first
+        document = await db.execute(select(Document).where(Document.id == db_document_id))
+        document = document.scalar_one_or_none()
+
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document with ID {db_document_id} not found"
+            )
+
+        document_id = document.document_id
+
+        # Remove from vector store memory
         if document_id in vector_store.indexes:
             del vector_store.indexes[document_id]
         if document_id in vector_store.chunks:
@@ -974,11 +1205,17 @@ async def delete_document(
             import shutil
             shutil.rmtree(doc_dir)
 
+        # Remove from database
+        await DatabaseService.delete_document_and_questions(db, db_document_id)
+
         return {
-            "message": f"Document {document_id} deleted successfully",
+            "message": f"Document {db_document_id} ({document_id}) deleted successfully from database and vector store",
+            "database_id": db_document_id,
             "document_id": document_id
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error deleting document: {e}")
         raise HTTPException(
@@ -988,40 +1225,19 @@ async def delete_document(
 
 
 @app.get("/api/v1/documents")
-async def list_documents(token: str = Depends(verify_token)):
-    """List all processed documents"""
+async def list_documents(
+        token: str = Depends(verify_token),
+        db: AsyncSession = Depends(get_db)
+):
+    """List all processed documents from database"""
     try:
-        documents = []
-
-        # Check memory
-        for doc_id in vector_store.chunks.keys():
-            chunk_count = len(vector_store.chunks[doc_id])
-            documents.append({
-                "document_id": doc_id,
-                "chunks_count": chunk_count,
-                "status": "loaded"
-            })
-
-        # Check disk for additional documents
-        if VECTOR_DB_DIR.exists():
-            for doc_dir in VECTOR_DB_DIR.iterdir():
-                if doc_dir.is_dir() and doc_dir.name not in [d["document_id"] for d in documents]:
-                    chunks_file = doc_dir / "chunks.json"
-                    if chunks_file.exists():
-                        try:
-                            with open(chunks_file, 'r') as f:
-                                chunks_data = json.load(f)
-                            documents.append({
-                                "document_id": doc_dir.name,
-                                "chunks_count": len(chunks_data),
-                                "status": "stored"
-                            })
-                        except Exception:
-                            pass
+        documents = await DatabaseService.get_all_documents(db)
 
         return {
             "total_documents": len(documents),
-            "documents": documents
+            "documents": [
+                DocumentListItem(**doc) for doc in documents
+            ]
         }
 
     except Exception as e:
@@ -1029,6 +1245,52 @@ async def list_documents(token: str = Depends(verify_token)):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list documents: {str(e)}"
+        )
+
+
+@app.get("/api/v1/documents/{db_document_id}/questions")
+async def get_document_questions(
+        db_document_id: int,
+        token: str = Depends(verify_token),
+        db: AsyncSession = Depends(get_db)
+):
+    """Get all questions and answers for a specific document"""
+    try:
+        # Verify document exists
+        document = await db.execute(select(Document).where(Document.id == db_document_id))
+        document = document.scalar_one_or_none()
+
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document with ID {db_document_id} not found"
+            )
+
+        questions = await DatabaseService.get_document_questions(db, db_document_id)
+
+        return {
+            "document_id": document.document_id,
+            "database_id": db_document_id,
+            "url": document.url,
+            "filename": document.filename,
+            "total_questions": len(questions),
+            "questions": [
+                QuestionHistoryItem(
+                    id=q.id,
+                    question_text=q.question_text,
+                    answer_text=q.answer_text,
+                    created_at=q.created_at
+                ) for q in questions
+            ]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document questions: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get document questions: {str(e)}"
         )
 
 
@@ -1113,6 +1375,36 @@ Answer:"""
         }
 
 
+@app.get("/api/v1/test-database")
+async def test_database(db: AsyncSession = Depends(get_db)):
+    """Test database connectivity"""
+    try:
+        # Get database info
+        db_info = await get_db_info()
+
+        # Count documents and questions
+        doc_count = await db.execute(select(Document))
+        doc_count = len(doc_count.scalars().all())
+
+        question_count = await db.execute(select(Question))
+        question_count = len(question_count.scalars().all())
+
+        return {
+            "status": "success",
+            "message": "Database connection is working",
+            "database_info": db_info,
+            "total_documents": doc_count,
+            "total_questions": question_count
+        }
+
+    except Exception as e:
+        logger.error(f"Database test failed: {e}")
+        return {
+            "status": "error",
+            "message": f"Database test failed: {str(e)}"
+        }
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Enhanced request logging middleware"""
@@ -1164,7 +1456,15 @@ async def general_exception_handler(request: Request, exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    logger.info("🚀 Starting RAG-Powered Document QA API")
+    logger.info("🚀 Starting RAG-Powered Document QA API with PostgreSQL")
+
+    # Initialize database
+    try:
+        await init_database()
+        logger.info("✅ Database tables created/verified")
+    except Exception as e:
+        logger.error(f"❌ Failed to create database tables: {e}")
+
     logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
     logger.info(f"🗃️ Vector DB directory: {VECTOR_DB_DIR}")
     logger.info(f"🧠 Embedding model: {EMBEDDING_MODEL_NAME}")
@@ -1179,12 +1479,26 @@ async def startup_event():
 
     logger.info(f"✅ Embedding model ready: {EMBEDDING_MODEL_NAME} (dim: {vector_store.dimension})")
 
+    # Test database connection
+    if await check_database_health():
+        logger.info("✅ Database connection successful")
+        db_info = await get_db_info()
+        logger.info(f"📊 Database: {db_info.get('database_name', 'unknown')}")
+    else:
+        logger.error("❌ Database connection failed")
+
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("🛑 Shutting down RAG-Powered Document QA API")
+
+    # Close database connections
+    try:
+        await close_database()
+    except Exception as e:
+        logger.error(f"❌ Error during shutdown: {e}")
 
 
 if __name__ == "__main__":
@@ -1200,4 +1514,3 @@ if __name__ == "__main__":
     }
 
     uvicorn.run("main:app", **config)
-
