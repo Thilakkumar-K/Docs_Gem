@@ -15,6 +15,7 @@ import httpx
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
 import time
 import hashlib
 import json
@@ -67,17 +68,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+load_dotenv()
 # Security
 security = HTTPBearer()
-VALID_TOKEN = "5b6105937b7cc769e46557d6241353e800d99cb57def59fd962d1d6ea8fcf736"
+VALID_TOKEN = os.getenv("VALID_TOKEN")
 
 # Configuration
-GEMINI_API_KEY = "AIzaSyAcgXOeBXAjVlLw5YfXgxz0WE6ECRFz2v4"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Lightweight but effective
-CHUNK_SIZE = 1000  # Characters per chunk
+CHUNK_SIZE = 2000  # Characters per chunk
 CHUNK_OVERLAP = 200  # Overlap between chunks
-TOP_K_RETRIEVAL = 5  # Number of chunks to retrieve
+TOP_K_RETRIEVAL = 10  # Number of chunks to retrieve
 MAX_CONTEXT_LENGTH = 10000  # Max context for Gemini
+
+# Validate they exist
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is required")
+if not VALID_TOKEN:
+    raise ValueError("VALID_TOKEN environment variable is required")
 
 # Initialize directories
 UPLOAD_DIR = Path("uploads")
