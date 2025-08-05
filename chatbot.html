@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Document QA Chatbot</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+            max-width: 1400px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            box-shadow: 0 0 50px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 320px;
+            background: linear-gradient(180deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .sidebar-header h1 {
+            font-size: 1.2em;
+            margin-bottom: 5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar-header p {
+            font-size: 0.85em;
+            opacity: 0.8;
+        }
+
+        .document-section {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .connection-status {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 0.85em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .connection-status.connected {
+            background: rgba(46, 204, 113, 0.2);
+            color: #2ecc71;
+            border: 1px solid rgba(46, 204, 113, 0.3);
+        }
+
+        .connection-status.disconnected {
+            background: rgba(231, 76, 60, 0.2);
+            color: #e74c3c;
+            border: 1px solid rgba(231, 76, 60, 0.3);
+        }
+
+        .connection-status.testing {
+            background: rgba(241, 196, 15, 0.2);
+            color: #f39c12;
+            border: 1px solid rgba(241, 196, 15, 0.3);
+        }
+
+        .document-upload {
+            margin-bottom: 20px;
+        }
+
+        .upload-area {
+            border: 2px dashed rgba(255, 255, 255, 0.3);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .upload-area:hover {
+            border-color: rgba(255, 255, 255, 0.6);
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .upload-area.dragover {
+            border-color: #3498db;
+            background: rgba(52, 152, 219, 0.1);
+        }
+
+        .upload-area.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        .url-input-section {
+            margin-top: 15px;
+        }
+
+        .url-input-group {
+            display: flex;
+            gap: 5px;
+        }
+
+        .url-input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            font-size: 0.9em;
+        }
+
+        .url-input::placeholder {
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .btn {
+            padding: 8px 15px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: #3498db;
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #2980b9;
+        }
+
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #c0392b;
+        }
+
+        .btn-secondary {
+            background: #95a5a6;
+            color: white;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #7f8c8d;
+        }
+
+        .api-config {
+            margin-bottom: 15px;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            font-size: 0.8em;
+        }
+
+        .api-config input {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            font-size: 0.8em;
+            margin-top: 5px;
+        }
+
+        .api-config input::placeholder {
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .document-list {
+            margin-top: 20px;
+        }
+
+        .document-list h3 {
+            font-size: 1em;
+            margin-bottom: 10px;
+            opacity: 0.9;
+        }
+
+        .document-item {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+
+        .document-item:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .document-item.active {
+            border-color: #3498db;
+            background: rgba(52, 152, 219, 0.2);
+        }
+
+        .document-item h4 {
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+
+        .document-item p {
+            font-size: 0.8em;
+            opacity: 0.7;
+        }
+
+        /* Chat Area */
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: white;
+        }
+
+        .chat-header {
+            padding: 20px;
+            background: linear-gradient(90deg, #3498db 0%, #2980b9 100%);
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .chat-header h2 {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.3em;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.9em;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #2ecc71;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 12px;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2em;
+            flex-shrink: 0;
+        }
+
+        .user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .bot .message-avatar {
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+            color: white;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 15px 20px;
+            border-radius: 18px;
+            position: relative;
+            word-wrap: break-word;
+        }
+
+        .user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+
+        .bot .message-content {
+            background: white;
+            color: #2c3e50;
+            border: 1px solid #e1e8ed;
+            border-bottom-left-radius: 5px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .message-info {
+            font-size: 0.8em;
+            opacity: 0.7;
+            margin-top: 8px;
+        }
+
+        .confidence-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75em;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+
+        .confidence-high {
+            background: rgba(46, 204, 113, 0.2);
+            color: #27ae60;
+        }
+
+        .confidence-medium {
+            background: rgba(241, 196, 15, 0.2);
+            color: #f39c12;
+        }
+
+        .confidence-low {
+            background: rgba(231, 76, 60, 0.2);
+            color: #e74c3c;
+        }
+
+        .sources-section {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #e1e8ed;
+        }
+
+        .sources-title {
+            font-size: 0.85em;
+            font-weight: bold;
+            margin-bottom: 8px;
+            color: #7f8c8d;
+        }
+
+        .source-item {
+            background: rgba(52, 152, 219, 0.05);
+            border-left: 3px solid #3498db;
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            border-radius: 0 6px 6px 0;
+            font-size: 0.85em;
+        }
+
+        .chat-input-container {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e1e8ed;
+        }
+
+        .chat-input-group {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 15px 20px;
+            border: 2px solid #e1e8ed;
+            border-radius: 25px;
+            font-size: 1em;
+            outline: none;
+            transition: all 0.3s ease;
+            resize: none;
+            min-height: 50px;
+            max-height: 120px;
+        }
+
+        .chat-input:focus {
+            border-color: #3498db;
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        .send-btn {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2em;
+            transition: all 0.3s ease;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            transform: scale(1.1);
+        }
+
+        .send-btn:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .typing-indicator {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .typing-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .typing-content {
+            background: white;
+            border: 1px solid #e1e8ed;
+            border-radius: 18px;
+            border-bottom-left-radius: 5px;
+            padding: 15px 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #bdc3c7;
+            animation: typing 1.4s infinite ease-in-out;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes typing {
+            0%, 80%, 100% {
+                transform: scale(0);
+                opacity: 0.5;
+            }
+            40% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .notification {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin: 10px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .error-message {
+            background: rgba(231, 76, 60, 0.1);
+            border: 1px solid rgba(231, 76, 60, 0.3);
+            color: #e74c3c;
+        }
+
+        .success-message {
+            background: rgba(46, 204, 113, 0.1);
+            border: 1px solid rgba(46, 204, 113, 0.3);
+            color: #27ae60;
+        }
+
+        .warning-message {
+            background: rgba(241, 196, 15, 0.1);
+            border: 1px solid rgba(241, 196, 15, 0.3);
+            color: #f39c12;
+        }
+
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+                height: auto;
+                max-height: 40vh;
+            }
+
+            .document-section {
+                padding: 15px;
+            }
+
+            .chat-container {
+                flex: 1;
+            }
+
+            .message-content {
+                max-width: 85%;
+            }
+        }
+
+        /* Scrollbar Styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #bdc3c7;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #95a5a6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h1><i class="fas fa-robot"></i> RAG Document QA</h1>
+                <p>Upload documents and ask questions</p>
+            </div>
+
+            <div class="document-section">
+                <!-- Connection Status -->
+                <div class="connection-status testing" id="connectionStatus">
+                    <i class="fas fa-wifi"></i>
+                    <span>Testing connection...</span>
+                </div>
+
+                <!-- API Configuration -->
+                <div class="api-config">
+                    <label>API URL:</label>
+                    <input type="text" id="apiUrlInput" placeholder="http://localhost:8000/api/v1" value="http://localhost:8000/api/v1">
+                    <button class="btn btn-secondary" id="testConnectionBtn" style="margin-top: 8px; width: 100%;">
+                        <i class="fas fa-plug"></i> Test Connection
+                    </button>
+                </div>
+
+                <!-- Document Upload -->
+                <div class="document-upload">
+                    <div class="upload-area disabled" id="uploadArea">
+                        <i class="fas fa-cloud-upload-alt" style="font-size: 2em; margin-bottom: 10px; opacity: 0.7;"></i>
+                        <p>Drop files here or click to upload</p>
+                        <p style="font-size: 0.8em; opacity: 0.6; margin-top: 5px;">PDF, DOCX, TXT, EML supported</p>
+                        <input type="file" id="fileInput" style="display: none;" accept=".pdf,.docx,.txt,.eml">
+                    </div>
+
+                    <div class="url-input-section">
+                        <div class="url-input-group">
+                            <input type="url" class="url-input" id="urlInput" placeholder="Or enter document URL..." disabled>
+                            <button class="btn btn-primary" id="urlSubmitBtn" disabled>
+                                <i class="fas fa-link"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Document List -->
+                <div class="document-list">
+                    <h3><i class="fas fa-folder"></i> Documents</h3>
+                    <div id="documentList">
+                        <p style="opacity: 0.6; font-size: 0.9em; text-align: center; padding: 20px;">
+                            No documents uploaded yet
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="chat-container">
+            <div class="chat-header">
+                <h2><i class="fas fa-comments"></i> Ask Questions</h2>
+                <div class="status-indicator">
+                    <div class="status-dot"></div>
+                    <span id="chatStatus">Offline</span>
+                </div>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="message bot">
+                    <div class="message-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        <p>Welcome! I'm your RAG-powered document assistant. Please test the connection first, then upload a document and start asking questions about its content.</p>
+                        <div class="message-info">
+                            <i class="fas fa-info-circle"></i> Ready to help
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-container">
+                <div class="chat-input-group">
+                    <textarea
+                        class="chat-input"
+                        id="messageInput"
+                        placeholder="First, test the connection and upload a document..."
+                        rows="1"
+                        disabled
+                    ></textarea>
+                    <button class="send-btn" id="sendBtn" disabled>
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class RAGChatbot {
+            constructor() {
+                this.apiUrl = 'http://localhost:8000/api/v1';
+                this.authToken = '5b6105937b7cc769e46557d6241353e800d99cb57def59fd962d1d6ea8fcf736';
+                this.currentDocumentId = null;
+                this.documents = new Map();
+                this.isConnected = false;
+
+                this.initializeDOMElements();
+                this.setupEventListeners();
+                this.loadSavedApiUrl();
+                this.testConnection();
+            }
+
+            initializeDOMElements() {
+                this.connectionStatus = document.getElementById('connectionStatus');
+                this.apiUrlInput = document.getElementById('apiUrlInput');
+                this.testConnectionBtn = document.getElementById('testConnectionBtn');
+                this.uploadArea = document.getElementById('uploadArea');
+                this.fileInput = document.getElementById('fileInput');
+                this.urlInput = document.getElementById('urlInput');
+                this.urlSubmitBtn = document.getElementById('urlSubmitBtn');
+                this.documentList = document.getElementById('documentList');
+                this.chatMessages = document.getElementById('chatMessages');
+                this.messageInput = document.getElementById('messageInput');
+                this.sendBtn = document.getElementById('sendBtn');
+                this.chatStatus = document.getElementById('chatStatus');
+            }
+
+            setupEventListeners() {
+                // Connection testing
+                this.testConnectionBtn.addEventListener('click', this.testConnection.bind(this));
+                this.apiUrlInput.addEventListener('change', this.saveApiUrl.bind(this));
+
+                // File upload
+                this.uploadArea.addEventListener('click', () => {
+                    if (this.isConnected) this.fileInput.click();
+                });
+                this.uploadArea.addEventListener('dragover', this.handleDragOver.bind(this));
+                this.uploadArea.addEventListener('dragleave', this.handleDragLeave.bind(this));
+                this.uploadArea.addEventListener('drop', this.handleDrop.bind(this));
+                this.fileInput.addEventListener('change', this.handleFileSelect.bind(this));
+
+                // URL submission
+                this.urlSubmitBtn.addEventListener('click', this.handleUrlSubmit.bind(this));
+                this.urlInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') this.handleUrlSubmit();
+                });
+
+                // Chat functionality
+                this.sendBtn.addEventListener('click', this.sendMessage.bind(this));
+                this.messageInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        this.sendMessage();
+                    }
+                });
+
+                // Auto-resize textarea
+                this.messageInput.addEventListener('input', this.autoResizeTextarea.bind(this));
+            }
+
+            loadSavedApiUrl() {
+                const saved = localStorage.getItem('rag_api_url');
+                if (saved) {
+                    this.apiUrlInput.value = saved;
+                    this.apiUrl = saved;
+                }
+            }
+
+            saveApiUrl() {
+                this.apiUrl = this.apiUrlInput.value.trim();
+                localStorage.setItem('rag_api_url', this.apiUrl);
+            }
+
+            async testConnection() {
+                this.updateConnectionStatus('testing', 'Testing connection...');
+                this.testConnectionBtn.disabled = true;
+                this.saveApiUrl();
+
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+                    const response = await fetch(`${this.apiUrl}/health`, {
+                        signal: controller.signal,
+                        headers: {
+                            'Accept': 'application/json',
+                        }
+                    });
+
+                    clearTimeout(timeoutId);
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.isConnected = true;
+                        this.updateConnectionStatus('connected', 'Connected');
+                        this.updateChatStatus('Ready');
+                        this.enableInterface();
+
+                        this.showSuccess(`Connected successfully! Server status: ${data.status}`);
+                        this.loadDocuments();
+                    } else {
+                        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                    }
+                } catch (error) {
+                    this.isConnected = false;
+                    this.updateConnectionStatus('disconnected', 'Connection failed');
+                    this.updateChatStatus('Offline');
+                    this.disableInterface();
+
+                    if (error.name === 'AbortError') {
+                        this.showError('Connection timeout. Please check if the server is running and try again.');
+                    } else {
+                        this.showError(`Connection failed: ${error.message}. Make sure the FastAPI server is running.`);
+                    }
+                } finally {
+                    this.testConnectionBtn.disabled = false;
+                }
+            }
+
+            updateConnectionStatus(type, message) {
+                this.connectionStatus.className = `connection-status ${type}`;
+                this.connectionStatus.innerHTML = `
+                    <i class="fas fa-${type === 'connected' ? 'check-circle' : type === 'testing' ? 'spinner fa-spin' : 'exclamation-triangle'}"></i>
+                    <span>${message}</span>
+                `;
+            }
+
+            updateChatStatus(status) {
+                this.chatStatus.textContent = status;
+                const statusDot = document.querySelector('.status-dot');
+
+                if (status === 'Ready') {
+                    statusDot.style.background = '#2ecc71';
+                } else if (status === 'Offline') {
+                    statusDot.style.background = '#e74c3c';
+                } else {
+                    statusDot.style.background = '#f39c12';
+                }
+            }
+
+            enableInterface() {
+                this.uploadArea.classList.remove('disabled');
+                this.urlInput.disabled = false;
+                this.urlSubmitBtn.disabled = false;
+            }
+
+            disableInterface() {
+                this.uploadArea.classList.add('disabled');
+                this.urlInput.disabled = true;
+                this.urlSubmitBtn.disabled = true;
+                this.messageInput.disabled = true;
+                this.sendBtn.disabled = true;
+            }
+
+            async loadDocuments() {
+                if (!this.isConnected) return;
+
+                try {
+                    const response = await fetch(`${this.apiUrl}/documents`, {
+                        headers: {
+                            'Authorization': `Bearer ${this.authToken}`
+                        }
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.renderDocumentList(data.documents);
+                    }
+                } catch (error) {
+                    console.error('Error loading documents:', error);
+                }
+            }
+
+            renderDocumentList(documents) {
+                if (!documents || documents.length === 0) {
+                    this.documentList.innerHTML = `
+                        <p style="opacity: 0.6; font-size: 0.9em; text-align: center; padding: 20px;">
+                            No documents uploaded yet
+                        </p>
+                    `;
+                    return;
+                }
+
+                this.documentList.innerHTML = documents.map(doc => `
+                    <div class="document-item" data-id="${doc.document_id}">
+                        <h4><i class="fas fa-file-alt"></i> Document ${doc.document_id.substring(0, 8)}...</h4>
+                        <p>${doc.chunks_count} chunks • ${doc.status}</p>
+                        <button class="btn btn-danger" style="margin-top: 8px; font-size: 0.8em; padding: 4px 8px;" onclick="chatbot.deleteDocument('${doc.document_id}')">
+                            <i class="fas fa-trash"></i> Delete
+                        </button>
+                    </div>
+                `).join('');
+
+                // Add click listeners
+                document.querySelectorAll('.document-item').forEach(item => {
+                    item.addEventListener('click', (e) => {
+                        if (!e.target.closest('button')) {
+                            this.selectDocument(item.dataset.id);
+                        }
+                    });
+                });
+            }
+
+            selectDocument(documentId) {
+                this.currentDocumentId = documentId;
+
+                // Update UI
+                document.querySelectorAll('.document-item').forEach(item => {
+                    item.classList.remove('active');
+                });
+                const selectedItem = document.querySelector(`[data-id="${documentId}"]`);
+                if (selectedItem) {
+                    selectedItem.classList.add('active');
+                }
+
+                // Enable chat
+                this.messageInput.disabled = false;
+                this.sendBtn.disabled = false;
+                this.messageInput.placeholder = 'Ask questions about your document...';
+
+                this.addBotMessage(`Document selected! You can now ask questions about this document.`);
+            }
+
+            async deleteDocument(documentId) {
+                if (!confirm('Are you sure you want to delete this document?')) return;
+
+                try {
+                    const response = await fetch(`${this.apiUrl}/documents/${documentId}`, {
+                        method: 'DELETE',
+                        headers: {
+                            'Authorization': `Bearer ${this.authToken}`
+                        }
+                    });
+
+                    if (response.ok) {
+                        this.showSuccess('Document deleted successfully');
+                        this.loadDocuments();
+
+                        if (this.currentDocumentId === documentId) {
+                            this.currentDocumentId = null;
+                            this.messageInput.disabled = true;
+                            this.sendBtn.disabled = true;
+                            this.messageInput.placeholder = 'Select a document to start asking questions...';
+                        }
+                    } else {
+                        this.showError('Failed to delete document');
+                    }
+                } catch (error) {
+                    this.showError('Error deleting document');
+                }
+            }
+
+            // File handling methods
+            handleDragOver(e) {
+                e.preventDefault();
+                if (this.isConnected) {
+                    this.uploadArea.classList.add('dragover');
+                }
+            }
+
+            handleDragLeave(e) {
+                e.preventDefault();
+                this.uploadArea.classList.remove('dragover');
+            }
+
+            handleDrop(e) {
+                e.preventDefault();
+                this.uploadArea.classList.remove('dragover');
+
+                if (!this.isConnected) return;
+
+                const files = Array.from(e.dataTransfer.files);
+                if (files.length > 0) {
+                    this.uploadFile(files[0]);
+                }
+            }
+
+            handleFileSelect(e) {
+                const file = e.target.files[0];
+                if (file && this.isConnected) {
+                    this.uploadFile(file);
+                }
+            }
+
+            async uploadFile(file) {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    this.showLoading('Uploading and processing document...');
+
+                    const response = await fetch(`${this.apiUrl}/documents/upload`, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${this.authToken}`
+                        },
+                        body: formData
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        this.showSuccess(`Document uploaded successfully! Created ${data.chunks_created} chunks.`);
+                        this.loadDocuments();
+                        this.fileInput.value = '';
+                    } else {
+                        this.showError(data.error || 'Failed to upload document');
+                    }
+                } catch (error) {
+                    this.showError('Error uploading document');
+                } finally {
+                    this.hideLoading();
+                }
+            }
+
+            async handleUrlSubmit() {
+                const url = this.urlInput.value.trim();
+                if (!url || !this.isConnected) return;
+
+                try {
+                    this.showLoading('Processing document from URL...');
+
+                    const response = await fetch(`${this.apiUrl}/hackrx/run`, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${this.authToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            documents: url,
+                            questions: ['Document processed successfully']
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        this.showSuccess('Document processed from URL successfully!');
+                        this.currentDocumentId = data.document_id;
+                        this.loadDocuments();
+                        this.urlInput.value = '';
+
+                        // Enable chat
+                        this.messageInput.disabled = false;
+                        this.sendBtn.disabled = false;
+                        this.messageInput.placeholder = 'Ask questions about your document...';
+                    } else {
+                        this.showError(data.error || 'Failed to process document from URL');
+                    }
+                } catch (error) {
+                    this.showError('Error processing document from URL');
+                } finally {
+                    this.hideLoading();
+                }
+            }
+
+            // Chat methods
+            async sendMessage() {
+                const message = this.messageInput.value.trim();
+                if (!message || !this.currentDocumentId || !this.isConnected) return;
+
+                // Add user message
+                this.addUserMessage(message);
+                this.messageInput.value = '';
+                this.autoResizeTextarea();
+
+                // Show typing indicator
+                this.showTyping();
+
+                try {
+                    const response = await fetch(`${this.apiUrl}/hackrx/run`, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${this.authToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            document_id: this.currentDocumentId,
+                            questions: [message]
+                        })
+                    });
+
+                    const data = await response.json();
+                    this.hideTyping();
+
+                    if (response.ok && data.answers && data.answers.length > 0) {
+                        const answer = data.answers[0];
+                        this.addBotMessage(answer.answer, answer.confidence, answer.sources);
+                    } else {
+                        this.addBotMessage('Sorry, I could not process your question. Please try again.');
+                    }
+                } catch (error) {
+                    this.hideTyping();
+                    this.addBotMessage('Error processing your question. Please try again.');
+                }
+            }
+
+            addUserMessage(message) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message user';
+                messageDiv.innerHTML = `
+                    <div class="message-avatar">
+                        <i class="fas fa-user"></i>
+                    </div>
+                    <div class="message-content">
+                        <p>${this.escapeHtml(message)}</p>
+                        <div class="message-info">
+                            ${new Date().toLocaleTimeString()}
+                        </div>
+                    </div>
+                `;
+                this.chatMessages.appendChild(messageDiv);
+                this.scrollToBottom();
+            }
+
+            addBotMessage(message, confidence = null, sources = null) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message bot';
+
+                let confidenceBadge = '';
+                if (confidence !== null) {
+                    const confidenceLevel = confidence > 0.7 ? 'high' : confidence > 0.4 ? 'medium' : 'low';
+                    confidenceBadge = `<span class="confidence-badge confidence-${confidenceLevel}">
+                        ${Math.round(confidence * 100)}% confidence
+                    </span>`;
+                }
+
+                let sourcesHtml = '';
+                if (sources && sources.length > 0) {
+                    sourcesHtml = `
+                        <div class="sources-section">
+                            <div class="sources-title">
+                                <i class="fas fa-book"></i> Sources:
+                            </div>
+                            ${sources.map((source, index) => `
+                                <div class="source-item">
+                                    <strong>Chunk ${source.chunk_id}:</strong>
+                                    ${this.escapeHtml(source.preview)}
+                                    <span style="color: #7f8c8d; font-size: 0.8em;">
+                                        (Similarity: ${Math.round(source.similarity_score * 100)}%)
+                                    </span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                }
+
+                messageDiv.innerHTML = `
+                    <div class="message-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        <p>${this.escapeHtml(message)}</p>
+                        <div class="message-info">
+                            <i class="fas fa-clock"></i> ${new Date().toLocaleTimeString()}
+                            ${confidenceBadge}
+                        </div>
+                        ${sourcesHtml}
+                    </div>
+                `;
+
+                this.chatMessages.appendChild(messageDiv);
+                this.scrollToBottom();
+            }
+
+            showTyping() {
+                const typingDiv = document.createElement('div');
+                typingDiv.className = 'typing-indicator';
+                typingDiv.id = 'typingIndicator';
+                typingDiv.innerHTML = `
+                    <div class="typing-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="typing-content">
+                        <div class="typing-dots">
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                        </div>
+                    </div>
+                `;
+                this.chatMessages.appendChild(typingDiv);
+                this.scrollToBottom();
+            }
+
+            hideTyping() {
+                const typingIndicator = document.getElementById('typingIndicator');
+                if (typingIndicator) {
+                    typingIndicator.remove();
+                }
+            }
+
+            scrollToBottom() {
+                this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+            }
+
+            autoResizeTextarea() {
+                const textarea = this.messageInput;
+                textarea.style.height = 'auto';
+                textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+            }
+
+            // Utility methods
+            escapeHtml(text) {
+                const map = {
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    '"': '&quot;',
+                    "'": '&#039;'
+                };
+                return text.replace(/[&<>"']/g, m => map[m]);
+            }
+
+            showError(message) {
+                this.removeNotifications();
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'notification error-message';
+                errorDiv.innerHTML = `
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <span>${message}</span>
+                    <button onclick="this.parentElement.remove()" style="margin-left: auto; background: none; border: none; color: inherit; cursor: pointer;">
+                        <i class="fas fa-times"></i>
+                    </button>
+                `;
+                document.querySelector('.document-section').prepend(errorDiv);
+
+                setTimeout(() => {
+                    if (errorDiv.parentElement) {
+                        errorDiv.remove();
+                    }
+                }, 8000);
+            }
+
+            showSuccess(message) {
+                this.removeNotifications();
+                const successDiv = document.createElement('div');
+                successDiv.className = 'notification success-message';
+                successDiv.innerHTML = `
+                    <i class="fas fa-check-circle"></i>
+                    <span>${message}</span>
+                    <button onclick="this.parentElement.remove()" style="margin-left: auto; background: none; border: none; color: inherit; cursor: pointer;">
+                        <i class="fas fa-times"></i>
+                    </button>
+                `;
+                document.querySelector('.document-section').prepend(successDiv);
+
+                setTimeout(() => {
+                    if (successDiv.parentElement) {
+                        successDiv.remove();
+                    }
+                }, 5000);
+            }
+
+            showWarning(message) {
+                this.removeNotifications();
+                const warningDiv = document.createElement('div');
+                warningDiv.className = 'notification warning-message';
+                warningDiv.innerHTML = `
+                    <i class="fas fa-exclamation-circle"></i>
+                    <span>${message}</span>
+                    <button onclick="this.parentElement.remove()" style="margin-left: auto; background: none; border: none; color: inherit; cursor: pointer;">
+                        <i class="fas fa-times"></i>
+                    </button>
+                `;
+                document.querySelector('.document-section').prepend(warningDiv);
+
+                setTimeout(() => {
+                    if (warningDiv.parentElement) {
+                        warningDiv.remove();
+                    }
+                }, 6000);
+            }
+
+            showLoading(message) {
+                this.updateChatStatus(message);
+                document.body.classList.add('loading');
+            }
+
+            hideLoading() {
+                this.updateChatStatus('Ready');
+                document.body.classList.remove('loading');
+            }
+
+            removeNotifications() {
+                document.querySelectorAll('.notification').forEach(el => el.remove());
+            }
+        }
+
+        // Initialize the chatbot when the page loads
+        let chatbot;
+        document.addEventListener('DOMContentLoaded', () => {
+            chatbot = new RAGChatbot();
+        });
+
+        // Add some helper functions for debugging
+        window.testAPI = async function() {
+            const urls = [
+                'http://localhost:8000/api/v1/health',
+                'http://127.0.0.1:8000/api/v1/health',
+                'http://0.0.0.0:8000/api/v1/health'
+            ];
+
+            console.log('🔍 Testing API endpoints...');
+
+            for (const url of urls) {
+                try {
+                    console.log(`Testing ${url}...`);
+                    const response = await fetch(url, {
+                        method: 'GET',
+                        headers: { 'Accept': 'application/json' }
+                    });
+                    const data = await response.json();
+                    console.log(`✅ Success with ${url}:`, data);
+                    return { url, data, status: 'success' };
+                } catch (error) {
+                    console.log(`❌ Failed with ${url}:`, error.message);
+                }
+            }
+            console.error('❌ All API endpoints failed');
+            return { status: 'failed', message: 'All endpoints failed' };
+        };
+
+        window.testGemini = async function() {
+            if (!chatbot.isConnected) {
+                console.error('❌ Not connected to API. Test connection first.');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${chatbot.apiUrl}/test-gemini`, {
+                    headers: {
+                        'Authorization': `Bearer ${chatbot.authToken}`
+                    }
+                });
+                const data = await response.json();
+                console.log('🧠 Gemini Test Result:', data);
+                return data;
+            } catch (error) {
+                console.error('❌ Gemini Test failed:', error);
+                return { status: 'error', message: error.message };
+            }
+        };
+
+        window.checkServerStatus = async function() {
+            console.log('🏥 Checking server health...');
+            const result = await testAPI();
+            if (result.status === 'success') {
+                console.log('✅ Server is healthy');
+                const geminiResult = await testGemini();
+                if (geminiResult.status === 'success') {
+                    console.log('✅ Gemini is working');
+                } else {
+                    console.log('⚠️ Gemini has issues:', geminiResult.message);
+                }
+            } else {
+                console.log('❌ Server is not responding');
+                console.log('💡 Make sure to run: python main.py');
+            }
+            return result;
+        };
+
+        // Add keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            // Ctrl/Cmd + U to focus upload
+            if ((e.ctrlKey || e.metaKey) && e.key === 'u') {
+                e.preventDefault();
+                if (chatbot.isConnected) {
+                    document.getElementById('fileInput').click();
+                }
+            }
+
+            // Ctrl/Cmd + L to focus URL input
+            if ((e.ctrlKey || e.metaKey) && e.key === 'l') {
+                e.preventDefault();
+                document.getElementById('urlInput').focus();
+            }
+
+            // Ctrl/Cmd + T to test connection
+            if ((e.ctrlKey || e.metaKey) && e.key === 't') {
+                e.preventDefault();
+                chatbot.testConnection();
+            }
+
+            // Escape to clear chat input
+            if (e.key === 'Escape') {
+                document.getElementById('messageInput').value = '';
+                chatbot.autoResizeTextarea();
+            }
+        });
+
+        // Show helpful tips in console
+        console.log(`
+🤖 RAG Document QA Chatbot - Developer Console
+
+Available commands:
+• testAPI() - Test all API endpoints
+• testGemini() - Test Gemini AI integration
+• checkServerStatus() - Full health check
+
+Keyboard shortcuts:
+• Ctrl/Cmd + U - Upload file
+• Ctrl/Cmd + L - Focus URL input
+• Ctrl/Cmd + T - Test connection
+• Escape - Clear chat input
+
+Troubleshooting:
+1. Make sure FastAPI server is running: python main.py
+2. Check server logs for errors
+3. Verify API URL in sidebar (default: http://localhost:8000/api/v1)
+4. Test connection using the "Test Connection" button
+
+Need help? Check the browser console for error messages.
+        `);
+
+        // Auto-check server status on load
+        setTimeout(() => {
+            console.log('🔄 Auto-checking server status...');
+            checkServerStatus();
+        }, 2000);
+    </script>
+</body>
+</html>
