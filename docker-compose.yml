@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - VALID_TOKEN=${VALID_TOKEN}
+      - EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
+      - CHUNK_SIZE=1000
+      - CHUNK_OVERLAP=200
+      - TOP_K_RETRIEVAL=5
+      - MAX_CONTEXT_LENGTH=4000
+    volumes:
+      - ./uploads:/app/uploads
+      - ./vector_db:/app/vector_db
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Redis for caching (if you want to add caching later)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   restart: unless-stopped
+
+# volumes:
+#   redis_data:

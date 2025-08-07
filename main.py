@@ -1187,17 +1187,34 @@ async def shutdown_event():
     logger.info("🛑 Shutting down RAG-Powered Document QA API")
 
 
+# Replace the bottom section of your main.py with this:
+
 if __name__ == "__main__":
     import uvicorn
 
-    # Enhanced configuration for production
+    # Get port from environment variable (important for Docker/cloud deployment)
+    port = int(os.getenv("PORT", 8000))
+
+    # Enhanced configuration for Docker
     config = {
-        "host": "0.0.0.0",
-        "port": 8000,
+        "app": "main:app",  # Use string format for better compatibility
+        "host": "0.0.0.0",  # Must be 0.0.0.0 for Docker
+        "port": port,
         "log_level": "info",
-        "reload": os.getenv("ENVIRONMENT", "development") == "development",
-        "workers": 1 if os.getenv("ENVIRONMENT", "development") == "development" else 4
+        "reload": False,  # Always False in production/Docker
+        "workers": 1,
+        "access_log": True,
+        "use_colors": False,  # Better for Docker logs
+        "loop": "asyncio"  # Specify event loop
     }
 
-    uvicorn.run("main:app", **config)
+    print(f"🚀 Starting server on http://0.0.0.0:{port}")
+
+    try:
+        uvicorn.run(**config)
+    except Exception as e:
+        print(f"❌ Server startup failed: {e}")
+        import sys
+
+        sys.exit(1)
 
