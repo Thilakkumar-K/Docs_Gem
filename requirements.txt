@@ -53,6 +53,9 @@ orjson==3.9.10
 # Production server
 gunicorn==21.2.0
 
+sentence-transformers==2.2.2
+huggingface_hub==0.12.1
+
 # Development and Testing (optional - remove for smaller builds)
 # pytest==7.4.3
 # pytest-asyncio==0.21.1
