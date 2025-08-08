@@ -939,23 +939,24 @@ class RAGLLMService:
         return "\n".join(context_parts)
 
     def _create_rag_prompt(self, question: str, context: str) -> str:
-        """Create optimized RAG prompt - IMPROVED VERSION"""
-        return f"""You are a helpful AI assistant that answers questions based on provided document context.
+        return f"""You are an expert assistant trained to answer questions based strictly on the following insurance policy content.
 
-    DOCUMENT CONTEXT:
+    DOCUMENT EXTRACT:
     {context}
 
-    QUESTION: {question}
+    QUESTION:
+    {question}
 
-    INSTRUCTIONS:
-    - Answer the question using ONLY the information provided in the context above
-    - Be specific and detailed in your response
-    - If the context contains the answer, provide a comprehensive response
-    - If the context doesn't contain enough information, clearly state: "The provided context doesn't contain sufficient information to answer this question completely."
-    - Quote relevant parts from the context when appropriate
-    - Be factual and avoid speculation beyond what's stated in the context
+    RESPONSE INSTRUCTIONS:
+    - Answer using only the document content.
+    - Provide complete, factual, and specific responses.
+    - Include exact terms, durations, limits, and conditions as stated in the document.
+    - If the document lists multiple relevant points or sub-clauses, include all of them.
+    - Format clearly in professional language, as if responding to a client or regulator.
+    - Do NOT add disclaimers, assumptions, or refer to "the context".
+    - If the information is not present, respond with: "The provided document does not contain sufficient information to answer this question."
 
-    ANSWER:"""
+    FINAL ANSWER:"""
 
     def _estimate_confidence(self, chunks: List[Dict[str, Any]]) -> float:
         """Estimate confidence based on similarity scores"""
@@ -1127,7 +1128,6 @@ async def upload_document(
 
 @app.post(
     "/api/v1/hackrx/run",
-    response_model=DocumentQAResponse,
     responses={
         400: {"model": ErrorResponse},
         401: {"model": ErrorResponse},
@@ -1140,7 +1140,7 @@ async def process_document_qa_rag(
         token: str = Depends(verify_token)
 ):
     """
-    Enhanced RAG-powered document QA endpoint with full Supabase Storage support
+    RAG-powered document QA endpoint - Returns simple answers array format
     """
     try:
         document_id = None
@@ -1176,18 +1176,8 @@ async def process_document_qa_rag(
                 detail="Either 'documents' URL/Supabase path or 'document_id' must be provided"
             )
 
-        # Process questions using RAG
-        # Process questions using RAG - FIXED VERSION
+        # Process questions using RAG - Extract only answer strings
         answers = []
-        retrieval_stats = {
-            "total_questions": len(request.questions),
-            "avg_chunks_retrieved": 0,
-            "avg_confidence": 0.0,
-            "storage_source": "supabase"
-        }
-
-        total_chunks = 0
-        total_confidence = 0.0
 
         for i, question in enumerate(request.questions):
             logger.info(f"Processing question {i + 1}/{len(request.questions)}: {question[:50]}...")
@@ -1197,44 +1187,24 @@ async def process_document_qa_rag(
                 document_id, question, TOP_K_RETRIEVAL
             )
 
-            # Log chunk retrieval for debugging
-            logger.info(f"📊 Retrieved {len(relevant_chunks)} chunks for question {i + 1}")
-
             # Generate answer using RAG
             answer_data = await rag_llm_service.generate_rag_answer(
                 question, relevant_chunks, document_id
             )
 
-            answer_data["question"] = question
-            answers.append(answer_data)
+            # Extract only the answer text as string
+            answer_text = answer_data.get("answer", "No answer generated")
+            answers.append(answer_text)
 
-            # Update stats - FIX: Use correct key from answer_data
-            chunks_retrieved = answer_data.get("chunks_retrieved", 0)
-            confidence = answer_data.get("confidence", 0.0)
-
-            total_chunks += chunks_retrieved
-            total_confidence += confidence
-
-            logger.info(f"📈 Question {i + 1} stats: {chunks_retrieved} chunks, {confidence:.2f} confidence")
+            logger.info(f"Generated answer {i + 1}: {answer_text[:100]}...")
 
             # Rate limiting for free tier
             await asyncio.sleep(0.5)
 
-        # Calculate averages
-        retrieval_stats["avg_chunks_retrieved"] = total_chunks / len(request.questions) if len(
-            request.questions) > 0 else 0
-        retrieval_stats["avg_confidence"] = total_confidence / len(request.questions) if len(
-            request.questions) > 0 else 0
+        logger.info("Successfully processed all questions using RAG")
 
-        logger.info(
-            f"🎯 Final stats: avg_chunks={retrieval_stats['avg_chunks_retrieved']:.1f}, avg_confidence={retrieval_stats['avg_confidence']:.2f}")
-
-        logger.info("Successfully processed all questions using RAG with Supabase storage")
-        return DocumentQAResponse(
-            answers=answers,
-            document_id=document_id,
-            retrieval_info=retrieval_stats
-        )
+        # Return simple format: only answers array with plain strings
+        return {"answers": answers}
 
     except HTTPException:
         raise
