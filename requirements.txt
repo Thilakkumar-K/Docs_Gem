@@ -31,25 +31,35 @@ nltk==3.8.1
 # Google Generative AI (Gemini)
 google-generativeai==0.3.2
 
-# Supabase
+# Supabase integration (UPDATED VERSIONS)
 supabase==2.3.0
+storage3==0.7.7
 
 # Database and Storage
 psycopg2-binary==2.9.9
 
-# Utilities
-pathlib==1.0.1
-hashlib2==1.0.1
-uuid==1.30
+# Email processing (for .eml files)
+email-validator==2.1.0
+
+# Utilities and Data Processing
+pandas==2.1.4
 
 # Logging and Monitoring
 python-json-logger==2.0.7
 
-# Development and Testing (optional)
-pytest==7.4.3
-pytest-asyncio==0.21.1
-black==23.11.0
-flake8==6.1.0
+# Performance optimization
+orjson==3.9.10
 
-# Production WSGI server (alternative to uvicorn)
+# Production server
 gunicorn==21.2.0
+
+# Development and Testing (optional - remove for smaller builds)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# black==23.11.0
+# flake8==6.1.0
+
+# REMOVED PROBLEMATIC PACKAGES:
+# pathlib==1.0.1  # Built into Python 3.4+
+# hashlib2==1.0.1  # Unnecessary, hashlib is built-in
+# uuid==1.30  # Built into Python standard library
