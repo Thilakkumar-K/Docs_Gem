@@ -23,7 +23,10 @@ import json
 import uuid
 from pathlib import Path
 import pickle
+import io
 from io import BytesIO
+
+from typing import Tuple  # Add this to existing typing imports
 
 import signal
 
@@ -95,78 +98,6 @@ class GracefulKiller:
 
 # Add this line after the GracefulKiller class definition
 killer = GracefulKiller()
-
-def save_faiss_index_to_bytes(index) -> bytes:
-    """
-    Save FAISS index to bytes using temporary file
-
-    Args:
-        index: FAISS index object
-
-    Returns:
-        bytes: Serialized FAISS index data
-    """
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        try:
-            # Write index to temporary file
-            faiss.write_index(index, tmp_file.name)
-
-            # Read the file content as bytes
-            with open(tmp_file.name, "rb") as f:
-                data = f.read()
-
-            return data
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(tmp_file.name)
-            except OSError:
-                pass
-
-
-async def upload_faiss_index_to_supabase(index, file_key: str):
-    """
-    Upload FAISS index to Supabase Storage
-
-    Args:
-        index: FAISS index object
-        file_key (str): Supabase storage path/key
-    """
-    logger.info(f"🧠 Converting FAISS index to bytes for upload to {file_key}")
-    index_bytes = save_faiss_index_to_bytes(index)
-    logger.info(f"✅ FAISS index converted to {len(index_bytes)} bytes")
-
-    await upload_file_to_supabase(file_key, index_bytes)
-    logger.info(f"✅ FAISS index uploaded to Supabase: {file_key}")
-
-
-def load_faiss_index_from_bytes(index_bytes: bytes):
-    """
-    Load FAISS index from bytes using temporary file
-
-    Args:
-        index_bytes (bytes): Serialized FAISS index data
-
-    Returns:
-        FAISS index object
-    """
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        try:
-            # Write bytes to temporary file
-            tmp_file.write(index_bytes)
-            tmp_file.flush()
-
-            # Load index from temporary file
-            index = faiss.read_index(tmp_file.name)
-            return index
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(tmp_file.name)
-            except OSError:
-                pass
-
-
 
 # Load environment variables FIRST
 load_dotenv()
@@ -528,40 +459,27 @@ class DocumentProcessor:
 
 
 class VectorStore:
-    """FAISS-based vector store with complete Supabase storage - CLOUD RUN OPTIMIZED"""
+    """FAISS-based vector store with direct Supabase storage - NO BUFFER/CACHE"""
 
     def __init__(self):
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         self.dimension = self.embedding_model.get_sentence_embedding_dimension()
-        self.indexes = {}  # document_id -> faiss index (in-memory cache)
-        self.chunks = {}  # document_id -> list of chunks (in-memory cache)
-        self.cache_limit = 5  # Limit cached documents for Cloud Run memory management
-
+        # REMOVED: No more in-memory cache/buffers
+        # self.indexes = {}
+        # self.chunks = {}
         logger.info(f"✅ Initialized vector store with {EMBEDDING_MODEL_NAME} (dim: {self.dimension})")
-        logger.info(f"☁️ Cloud Run optimized with cache limit: {self.cache_limit} documents")
-        logger.info("📡 Using FULL Supabase storage - NO local file storage")
+        logger.info("🚫 NO BUFFER MODE - All data stored directly in Supabase")
 
-    def _manage_cache(self):
-        """Manage memory cache size for Cloud Run"""
-        if len(self.indexes) > self.cache_limit:
-            # Remove oldest entries (simple LRU simulation)
-            oldest_key = next(iter(self.indexes))
-            del self.indexes[oldest_key]
-            if oldest_key in self.chunks:
-                del self.chunks[oldest_key]
-            logger.info(f"🗑️ Removed cached document {oldest_key} to manage memory")
-
-    # Add this method to your existing VectorStore class
     async def create_embeddings(self, document_id: str, chunks: List[Dict[str, Any]]) -> int:
-        """Create embeddings for document chunks and store everything in Supabase - Cloud Run optimized"""
+        """Create embeddings and store directly in Supabase - NO BUFFER"""
         try:
-            logger.info(f"Creating embeddings for {len(chunks)} chunks")
+            logger.info(f"Creating embeddings for {len(chunks)} chunks - DIRECT TO SUPABASE")
 
             # Extract text from chunks
             texts = [chunk["text"] for chunk in chunks]
 
-            # Generate embeddings (process in batches for memory efficiency)
-            batch_size = 32  # Smaller batches for Cloud Run
+            # Generate embeddings in batches
+            batch_size = 32
             all_embeddings = []
 
             for i in range(0, len(texts), batch_size):
@@ -574,25 +492,14 @@ class VectorStore:
             embeddings = np.vstack(all_embeddings).astype('float32')
 
             # Create FAISS index
-            index = faiss.IndexFlatIP(self.dimension)  # Inner Product for cosine similarity
-
-            # Normalize embeddings for cosine similarity
+            index = faiss.IndexFlatIP(self.dimension)
             faiss.normalize_L2(embeddings)
-
-            # Add embeddings to index
             index.add(embeddings)
 
-            # Manage cache before storing
-            self._manage_cache()
+            # Save DIRECTLY to Supabase (no buffer storage)
+            await self._save_to_supabase_direct(document_id, embeddings, chunks)
 
-            # Store in memory cache for immediate use
-            self.indexes[document_id] = index
-            self.chunks[document_id] = chunks
-
-            # Save to Supabase Storage
-            await self._save_to_supabase(document_id, index, chunks)
-
-            logger.info(f"✅ Created FAISS index with {len(chunks)} vectors and saved to Supabase")
+            logger.info(f"✅ Created and saved {len(chunks)} vectors directly to Supabase")
             return len(chunks)
 
         except Exception as e:
@@ -604,90 +511,67 @@ class VectorStore:
 
     async def search_similar_chunks(self, document_id: str, query: str, top_k: int = TOP_K_RETRIEVAL) -> List[
         Dict[str, Any]]:
-        """Search for similar chunks using semantic similarity - ENHANCED LOGGING"""
+        """Search for similar chunks by loading from Supabase on-demand"""
         try:
-            logger.info(f"🔍 Searching for chunks in document {document_id} with query: '{query[:50]}...'")
+            logger.info(f"🔍 Searching document {document_id} for: '{query[:50]}...'")
 
-            # Check if document is in memory cache
-            if document_id not in self.indexes:
-                logger.info(f"📥 Document {document_id} not in memory cache, loading from Supabase...")
-                # Load from Supabase instead of local disk
-                await self._load_from_supabase(document_id)
-            else:
-                logger.info(f"🎯 Using cached document {document_id}")
+            # Load embeddings and chunks from Supabase
+            embeddings, chunks = await self._load_from_supabase_direct(document_id)
 
-            if document_id not in self.indexes:
-                logger.error(f"❌ Document {document_id} not found after attempting to load from Supabase")
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Document {document_id} not found in vector store"
-                )
+            # Create temporary FAISS index for search
+            index = faiss.IndexFlatIP(self.dimension)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
 
-            # Log vector store info
-            index = self.indexes[document_id]
-            chunks = self.chunks[document_id]
-            logger.info(f"📊 Vector store info - Index vectors: {index.ntotal}, Cached chunks: {len(chunks)}")
+            logger.info(f"📊 Loaded {index.ntotal} vectors from Supabase")
 
             # Generate query embedding
-            logger.info("🧠 Generating query embedding...")
             query_embedding = self.embedding_model.encode([query])
             query_embedding = query_embedding.astype('float32')
             faiss.normalize_L2(query_embedding)
 
             # Search similar vectors
-            logger.info(f"🔎 Searching for top-{min(top_k, index.ntotal)} similar vectors...")
             scores, indices = index.search(query_embedding, min(top_k, index.ntotal))
 
             # Retrieve corresponding chunks
             retrieved_chunks = []
             for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-                if idx != -1:  # Valid index
-                    chunk = self.chunks[document_id][idx].copy()
+                if idx != -1:
+                    chunk = chunks[idx].copy()
                     chunk["similarity_score"] = float(score)
                     chunk["rank"] = i + 1
                     retrieved_chunks.append(chunk)
 
-            logger.info(f"✅ Retrieved {len(retrieved_chunks)} relevant chunks for query")
-
-            # Log top chunks for debugging
-            if retrieved_chunks:
-                logger.info("🏆 Top retrieved chunks:")
-                for chunk in retrieved_chunks[:3]:
-                    logger.info(
-                        f"   Rank {chunk['rank']}: Score {chunk['similarity_score']:.3f} - {chunk['text'][:80]}...")
-            else:
-                logger.warning(f"⚠️ No chunks retrieved for query: '{query}'")
-
+            logger.info(f"✅ Retrieved {len(retrieved_chunks)} relevant chunks")
             return retrieved_chunks
 
-        except HTTPException:
-            raise
         except Exception as e:
-            logger.error(f"❌ Error searching similar chunks: {e}")
-            logger.error(f"❌ Search error details: {type(e).__name__}: {str(e)}")
+            logger.error(f"❌ Error searching chunks: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to search chunks: {str(e)}"
             )
 
-    async def _save_to_supabase(self, document_id: str, index, chunks: List[Dict[str, Any]]):
-        """Save FAISS index and chunks to Supabase Storage"""
+    async def _save_to_supabase_direct(self, document_id: str, embeddings: np.ndarray, chunks: List[Dict[str, Any]]):
+        """Save embeddings and chunks directly to Supabase as separate files"""
         try:
-            logger.info(f"Saving vector data to Supabase for document {document_id}")
+            logger.info(f"💾 Saving vector data directly to Supabase for {document_id}")
 
-            # Upload FAISS index using the helper function
-            index_path = f"vectors/{document_id}/index.faiss"
-            await upload_faiss_index_to_supabase(index, index_path)
+            # Save embeddings as numpy array
+            embeddings_bytes = io.BytesIO()
+            np.save(embeddings_bytes, embeddings)
+            embeddings_data = embeddings_bytes.getvalue()
 
-            # Serialize chunks to JSON bytes
+            embeddings_path = f"vectors/{document_id}/embeddings.npy"
+            await upload_file_to_supabase(embeddings_path, embeddings_data)
+
+            # Save chunks as JSON
             chunks_json = json.dumps(chunks, indent=2)
             chunks_bytes = chunks_json.encode('utf-8')
-
-            # Upload chunks to Supabase
             chunks_path = f"vectors/{document_id}/chunks.json"
             await upload_file_to_supabase(chunks_path, chunks_bytes)
 
-            # Also save metadata file
+            # Save metadata
             metadata = {
                 "document_id": document_id,
                 "chunks_count": len(chunks),
@@ -701,52 +585,48 @@ class VectorStore:
             metadata_path = f"vectors/{document_id}/metadata.json"
             await upload_file_to_supabase(metadata_path, metadata_bytes)
 
-            logger.info(f"✅ Saved vector data to Supabase: {index_path}, {chunks_path}, {metadata_path}")
+            logger.info(f"✅ Saved vector data directly to Supabase: {embeddings_path}, {chunks_path}, {metadata_path}")
 
         except Exception as e:
             logger.error(f"Error saving to Supabase: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to save vector data to Supabase: {str(e)}"
+                detail=f"Failed to save vector data: {str(e)}"
             )
 
-    async def _load_from_supabase(self, document_id: str):
-        """Load FAISS index and chunks from Supabase Storage"""
+    async def _load_from_supabase_direct(self, document_id: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        """Load embeddings and chunks directly from Supabase"""
         try:
-            logger.info(f"Loading vector data from Supabase for document {document_id}")
+            logger.info(f"📥 Loading vector data from Supabase for {document_id}")
 
-            # Define file paths
-            index_path = f"vectors/{document_id}/index.faiss"
-            chunks_path = f"vectors/{document_id}/chunks.json"
-
-            # Download index from Supabase
+            # Load embeddings
+            embeddings_path = f"vectors/{document_id}/embeddings.npy"
             try:
-                index_bytes = await download_file_from_supabase(index_path)
-                index = load_faiss_index_from_bytes(index_bytes)
+                embeddings_bytes = await download_file_from_supabase(embeddings_path)
+                embeddings_io = io.BytesIO(embeddings_bytes)
+                embeddings = np.load(embeddings_io)
             except Exception as e:
-                logger.error(f"Failed to download index from {index_path}: {e}")
+                logger.error(f"Failed to load embeddings from {embeddings_path}: {e}")
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Vector index not found for document {document_id}"
+                    detail=f"Embeddings not found for document {document_id}"
                 )
 
-            # Download chunks from Supabase
+            # Load chunks
+            chunks_path = f"vectors/{document_id}/chunks.json"
             try:
                 chunks_bytes = await download_file_from_supabase(chunks_path)
                 chunks_json = chunks_bytes.decode('utf-8')
                 chunks = json.loads(chunks_json)
             except Exception as e:
-                logger.error(f"Failed to download chunks from {chunks_path}: {e}")
+                logger.error(f"Failed to load chunks from {chunks_path}: {e}")
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Chunks data not found for document {document_id}"
+                    detail=f"Chunks not found for document {document_id}"
                 )
 
-            # Store in memory cache
-            self.indexes[document_id] = index
-            self.chunks[document_id] = chunks
-
-            logger.info(f"✅ Loaded vector data from Supabase for document {document_id}")
+            logger.info(f"✅ Loaded {len(embeddings)} embeddings and {len(chunks)} chunks from Supabase")
+            return embeddings, chunks
 
         except HTTPException:
             raise
@@ -754,29 +634,21 @@ class VectorStore:
             logger.error(f"Error loading from Supabase: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to load vector data from Supabase: {str(e)}"
+                detail=f"Failed to load vector data: {str(e)}"
             )
 
-
     async def delete_document_vectors(self, document_id: str) -> bool:
-        """Delete document vectors from both memory and Supabase"""
+        """Delete document vectors from Supabase"""
         try:
-            logger.info(f"Deleting vector data for document {document_id}")
+            logger.info(f"🗑️ Deleting vector data for document {document_id}")
 
-            # Remove from memory cache
-            if document_id in self.indexes:
-                del self.indexes[document_id]
-            if document_id in self.chunks:
-                del self.chunks[document_id]
-
-            # Delete from Supabase
-            index_path = f"vectors/{document_id}/index.faiss"
+            # Delete all vector files
+            embeddings_path = f"vectors/{document_id}/embeddings.npy"
             chunks_path = f"vectors/{document_id}/chunks.json"
             metadata_path = f"vectors/{document_id}/metadata.json"
 
-            # Delete all files (don't fail if one doesn't exist)
             results = []
-            for path in [index_path, chunks_path, metadata_path]:
+            for path in [embeddings_path, chunks_path, metadata_path]:
                 try:
                     result = await delete_file_from_supabase(path)
                     results.append(result)
@@ -784,8 +656,8 @@ class VectorStore:
                     logger.warning(f"Failed to delete {path}: {e}")
                     results.append(False)
 
-            success = any(results)  # Success if at least one file was deleted
-            logger.info(f"✅ Deleted vector data for document {document_id} from Supabase")
+            success = any(results)
+            logger.info(f"✅ Deleted vector data for document {document_id}")
             return success
 
         except Exception as e:
@@ -795,24 +667,18 @@ class VectorStore:
     async def list_stored_documents(self) -> List[Dict[str, Any]]:
         """List all documents with vector data in Supabase"""
         try:
-            supabase_manager = get_supabase_manager()
-            files = await supabase_manager.list_files()
+            files = await list_supabase_files()
 
-            # Find all metadata files
             documents = []
             for file_info in files:
                 file_path = file_info.get('name', '')
                 if file_path.startswith('vectors/') and file_path.endswith('/metadata.json'):
                     try:
-                        # Extract document_id from path
                         document_id = file_path.split('/')[1]
 
-                        # Download and parse metadata
+                        # Load metadata
                         metadata_bytes = await download_file_from_supabase(file_path)
                         metadata = json.loads(metadata_bytes.decode('utf-8'))
-
-                        # Check if document is currently loaded in memory
-                        is_loaded = document_id in self.indexes
 
                         documents.append({
                             "document_id": document_id,
@@ -820,19 +686,34 @@ class VectorStore:
                             "total_characters": metadata.get("total_characters", 0),
                             "embedding_model": metadata.get("embedding_model", "unknown"),
                             "created_at": metadata.get("created_at", 0),
-                            "status": "loaded" if is_loaded else "stored",
+                            "status": "stored_in_supabase",
                             "supabase_path": f"vectors/{document_id}/"
                         })
                     except Exception as e:
                         logger.warning(f"Failed to process metadata file {file_path}: {e}")
                         continue
 
-            logger.info(f"Found {len(documents)} documents with vector data in Supabase")
+            logger.info(f"Found {len(documents)} documents in Supabase")
             return documents
 
         except Exception as e:
-            logger.error(f"Error listing stored documents: {e}")
+            logger.error(f"Error listing documents: {e}")
             return []
+
+    async def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """Get chunks for a specific document from Supabase"""
+        try:
+            chunks_path = f"vectors/{document_id}/chunks.json"
+            chunks_bytes = await download_file_from_supabase(chunks_path)
+            chunks_json = chunks_bytes.decode('utf-8')
+            chunks = json.loads(chunks_json)
+            return chunks
+        except Exception as e:
+            logger.error(f"Error getting chunks: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chunks not found for document {document_id}"
+            )
 
 
 
@@ -1070,8 +951,9 @@ async def health_check():
             "storage_mode": "FULL_SUPABASE_ONLY"
         },
         "memory_usage": {
-            "cached_documents": len(vector_store.indexes),
-            "cached_chunks": sum(len(chunks) for chunks in vector_store.chunks.values())
+            "cached_documents": 0,  # No more caching
+            "cached_chunks": 0,     # No more buffering
+            "storage_mode": "direct_supabase_only"
         }
     }
 
@@ -1211,19 +1093,17 @@ async def process_document_qa_rag(
             # Extract text and get document ID
             text, document_id = await DocumentProcessor.process_document_from_source(request.documents)
 
-            # Check if we already have this document processed (check Supabase)
-            if document_id not in vector_store.indexes:
-                # Try to load from Supabase first
-                try:
-                    await vector_store._load_from_supabase(document_id)
-                    logger.info(f"Loaded existing vector index from Supabase for document {document_id}")
-                except HTTPException:
-                    # Document not found in Supabase, create new one
-                    chunks = DocumentProcessor.intelligent_chunking(text)
-                    await vector_store.create_embeddings(document_id, chunks)
-                    logger.info(f"Created new vector index in Supabase for document {document_id}")
-            else:
-                logger.info(f"Using cached vector index for document {document_id}")
+            # Check if we already have this document processed in Supabase
+            try:
+                # Try to load from Supabase to see if it exists
+                await vector_store._load_from_supabase_direct(document_id)
+                logger.info(f"✅ Found existing vector data in Supabase for document {document_id}")
+            except HTTPException:
+                # Document not found in Supabase, create new one
+                logger.info(f"📝 Creating new vector index for document {document_id}")
+                chunks = DocumentProcessor.intelligent_chunking(text)
+                await vector_store.create_embeddings(document_id, chunks)
+                logger.info(f"✅ Created new vector index in Supabase for document {document_id}")
 
         elif request.document_id:
             document_id = request.document_id
@@ -1280,25 +1160,15 @@ async def get_document_chunks(
         document_id: str,
         token: str = Depends(verify_token)
 ):
-    """Get chunks for a specific document from Supabase"""
+    """Get chunks for a specific document from Supabase - NO BUFFER"""
     try:
-        # Check memory cache first
-        if document_id not in vector_store.chunks:
-            # Load from Supabase
-            await vector_store._load_from_supabase(document_id)
-
-        if document_id not in vector_store.chunks:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Document {document_id} not found in Supabase storage"
-            )
-
-        chunks = vector_store.chunks[document_id]
+        # Load chunks directly from Supabase
+        chunks = await vector_store.get_document_chunks(document_id)
 
         return {
             "document_id": document_id,
             "total_chunks": len(chunks),
-            "storage_source": "supabase",
+            "storage_source": "supabase_direct",
             "chunks": [
                 {
                     "chunk_id": chunk["chunk_id"],
@@ -1318,7 +1188,6 @@ async def get_document_chunks(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve chunks: {str(e)}"
         )
-
 
 @app.post("/api/v1/documents/{document_id}/search")
 async def search_document_chunks(
