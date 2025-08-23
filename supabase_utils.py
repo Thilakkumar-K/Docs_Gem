@@ -58,18 +58,41 @@ class SupabaseStorageManager:
             raise ValueError(f"Failed to initialize Supabase client: {e}")
 
     def _verify_bucket_access(self):
-        """Verify that we can access the bucket"""
+        """Verify that we can access the bucket with timeout"""
         try:
             logger.info(f"🔍 Verifying access to bucket '{self.bucket_name}'...")
-            result = self.supabase.storage.from_(self.bucket_name).list()
 
-            if result is not None:
-                logger.info(f"✅ Successfully verified access to bucket '{self.bucket_name}' - Found {len(result) if isinstance(result, list) else 'unknown'} items")
-            else:
-                logger.warning(f"⚠️ Bucket access returned None for '{self.bucket_name}'")
+            # Add a simple timeout mechanism
+            import signal
+
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Bucket verification timeout")
+
+            # Set up timeout (only on non-Windows systems)
+            if hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)  # 5 second timeout
+
+            try:
+                result = self.supabase.storage.from_(self.bucket_name).list()
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # Cancel timeout
+
+                if result is not None:
+                    logger.info(
+                        f"✅ Successfully verified access to bucket '{self.bucket_name}' - Found {len(result) if isinstance(result, list) else 'unknown'} items")
+                else:
+                    logger.warning(f"⚠️ Bucket access returned None for '{self.bucket_name}'")
+            except TimeoutError:
+                logger.warning(f"⚠️ Bucket verification timed out for '{self.bucket_name}'")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not verify bucket access: {e}")
+            finally:
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # Ensure timeout is cancelled
 
         except Exception as e:
-            logger.warning(f"⚠️ Could not verify bucket access: {e}")
+            logger.warning(f"⚠️ Bucket verification setup failed: {e}")
 
     async def upload_file_to_supabase(self, file_name: str, file_data: bytes, overwrite: bool = True) -> str:
         """

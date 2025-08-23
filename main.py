@@ -15,6 +15,7 @@ import httpx
 import asyncio
 import logging
 import os
+import sys  # Add this line
 from dotenv import load_dotenv
 import time
 import hashlib
@@ -23,6 +24,8 @@ import uuid
 from pathlib import Path
 import pickle
 from io import BytesIO
+
+import signal
 
 # Document processing imports
 import PyPDF2
@@ -50,18 +53,48 @@ from supabase_utils import (
     delete_file_from_supabase,
     get_supabase_manager,
     list_supabase_files,
-    test_supabase_upload_standalone  # Added for testing
+    test_supabase_upload_standalone
 )
+
+import tempfile
+
+# Configure logging with more detailed format for better debugging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Download required NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    nltk.download('punkt')
+    try:
+        nltk.download('punkt', quiet=True)
+    except:
+        try:
+            nltk.download('punkt_tab', quiet=True)
+        except:
+            logger.warning("Could not download NLTK punkt tokenizer")
+            pass
 
-import tempfile
-import os
+# Add this class after the imports and before the existing code
+class GracefulKiller:
+    """Handle graceful shutdown for Cloud Run"""
+    kill_now = False
+    def __init__(self):
+        signal.signal(signal.SIGINT, self._exit_gracefully)
+        signal.signal(signal.SIGTERM, self._exit_gracefully)
 
+    def _exit_gracefully(self, signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        self.kill_now = True
+
+# Add this line after the GracefulKiller class definition
+killer = GracefulKiller()
 
 def save_faiss_index_to_bytes(index) -> bytes:
     """
@@ -133,12 +166,7 @@ def load_faiss_index_from_bytes(index_bytes: bytes):
             except OSError:
                 pass
 
-# Configure logging with more detailed format for better debugging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
 
 # Load environment variables FIRST
 load_dotenv()
@@ -500,28 +528,50 @@ class DocumentProcessor:
 
 
 class VectorStore:
-    """FAISS-based vector store with complete Supabase storage - NO LOCAL STORAGE"""
+    """FAISS-based vector store with complete Supabase storage - CLOUD RUN OPTIMIZED"""
 
     def __init__(self):
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         self.dimension = self.embedding_model.get_sentence_embedding_dimension()
         self.indexes = {}  # document_id -> faiss index (in-memory cache)
         self.chunks = {}  # document_id -> list of chunks (in-memory cache)
+        self.cache_limit = 5  # Limit cached documents for Cloud Run memory management
 
         logger.info(f"✅ Initialized vector store with {EMBEDDING_MODEL_NAME} (dim: {self.dimension})")
+        logger.info(f"☁️ Cloud Run optimized with cache limit: {self.cache_limit} documents")
         logger.info("📡 Using FULL Supabase storage - NO local file storage")
 
+    def _manage_cache(self):
+        """Manage memory cache size for Cloud Run"""
+        if len(self.indexes) > self.cache_limit:
+            # Remove oldest entries (simple LRU simulation)
+            oldest_key = next(iter(self.indexes))
+            del self.indexes[oldest_key]
+            if oldest_key in self.chunks:
+                del self.chunks[oldest_key]
+            logger.info(f"🗑️ Removed cached document {oldest_key} to manage memory")
+
+    # Add this method to your existing VectorStore class
     async def create_embeddings(self, document_id: str, chunks: List[Dict[str, Any]]) -> int:
-        """Create embeddings for document chunks and store everything in Supabase"""
+        """Create embeddings for document chunks and store everything in Supabase - Cloud Run optimized"""
         try:
             logger.info(f"Creating embeddings for {len(chunks)} chunks")
 
             # Extract text from chunks
             texts = [chunk["text"] for chunk in chunks]
 
-            # Generate embeddings
-            embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
-            embeddings = embeddings.astype('float32')
+            # Generate embeddings (process in batches for memory efficiency)
+            batch_size = 32  # Smaller batches for Cloud Run
+            all_embeddings = []
+
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                batch_embeddings = self.embedding_model.encode(batch_texts, show_progress_bar=False)
+                all_embeddings.append(batch_embeddings)
+                logger.info(f"Processed batch {i // batch_size + 1}/{(len(texts) - 1) // batch_size + 1}")
+
+            # Combine all embeddings
+            embeddings = np.vstack(all_embeddings).astype('float32')
 
             # Create FAISS index
             index = faiss.IndexFlatIP(self.dimension)  # Inner Product for cosine similarity
@@ -532,11 +582,14 @@ class VectorStore:
             # Add embeddings to index
             index.add(embeddings)
 
+            # Manage cache before storing
+            self._manage_cache()
+
             # Store in memory cache for immediate use
             self.indexes[document_id] = index
             self.chunks[document_id] = chunks
 
-            # Save to Supabase Storage instead of local disk
+            # Save to Supabase Storage
             await self._save_to_supabase(document_id, index, chunks)
 
             logger.info(f"✅ Created FAISS index with {len(chunks)} vectors and saved to Supabase")
@@ -782,6 +835,7 @@ class VectorStore:
             return []
 
 
+
 class RAGLLMService:
     """Enhanced LLM service with RAG capabilities"""
 
@@ -985,19 +1039,21 @@ rag_llm_service = RAGLLMService()
 # API Routes
 @app.get("/api/v1/health")
 async def health_check():
-    """Enhanced health check with Supabase status"""
+    """Enhanced health check with Supabase status for Cloud Run"""
     supabase_status = "unknown"
     try:
         supabase_manager = get_supabase_manager()
-        # Test Supabase connection by attempting to list files
+        # Quick test Supabase connection
         await supabase_manager.list_files()
         supabase_status = "connected"
     except Exception as e:
-        supabase_status = f"error: {str(e)}"
+        supabase_status = f"error: {str(e)[:100]}"  # Truncate long error messages
 
     return {
         "status": "healthy",
         "timestamp": time.time(),
+        "environment": os.getenv("ENVIRONMENT", "development"),
+        "platform": "google-cloud-run",
         "services": {
             "gemini_available": rag_llm_service.model is not None,
             "gemini_model": rag_llm_service.model_name,
@@ -1012,9 +1068,12 @@ async def health_check():
             "max_context_length": MAX_CONTEXT_LENGTH,
             "supabase_bucket": os.getenv("SUPABASE_BUCKET", "documents"),
             "storage_mode": "FULL_SUPABASE_ONLY"
+        },
+        "memory_usage": {
+            "cached_documents": len(vector_store.indexes),
+            "cached_chunks": sum(len(chunks) for chunks in vector_store.chunks.values())
         }
     }
-
 
 @app.post("/api/v1/documents/upload")
 async def upload_document(
@@ -1625,21 +1684,40 @@ async def test_vector_storage():
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Enhanced request logging middleware"""
+async def cloud_run_request_middleware(request: Request, call_next):
+    """Enhanced request logging middleware optimized for Cloud Run"""
     start_time = time.time()
 
-    # Log request
-    logger.info(f"Request: {request.method} {request.url.path}")
+    # Check for graceful shutdown
+    if killer.kill_now:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Service is shutting down"}
+        )
 
-    # Process request
-    response = await call_next(request)
+    # Log request (with truncated URL for Cloud Run logs)
+    path = request.url.path
+    method = request.method
+    logger.info(f"Request: {method} {path}")
 
-    # Log response with timing
-    process_time = time.time() - start_time
-    logger.info(f"Response: {response.status_code} ({process_time:.3f}s)")
+    try:
+        # Process request
+        response = await call_next(request)
 
-    return response
+        # Log response with timing
+        process_time = time.time() - start_time
+        logger.info(f"Response: {response.status_code} ({process_time:.3f}s)")
+
+        # Add Cloud Run specific headers
+        response.headers["X-Cloud-Run-Service"] = "rag-document-qa-api"
+        response.headers["X-Response-Time"] = f"{process_time:.3f}s"
+
+        return response
+
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(f"Request failed: {method} {path} - {str(e)} ({process_time:.3f}s)")
+        raise
 
 
 # Error handlers
@@ -1674,17 +1752,20 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 # Startup event
+# Startup event (replace the existing startup_event function)
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup with comprehensive debugging"""
-    logger.info("🚀 Starting RAG-Powered Document QA API with FULL Supabase Storage")
+    """Initialize services on startup with Cloud Run optimizations"""
+    logger.info("🚀 Starting RAG-Powered Document QA API on Google Cloud Run")
     logger.info("📡 NO LOCAL STORAGE - All data stored in Supabase")
     logger.info(f"🧠 Embedding model: {EMBEDDING_MODEL_NAME}")
     logger.info(f"⚙️ Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
     logger.info(f"🔍 Top-K retrieval: {TOP_K_RETRIEVAL}")
     logger.info(f"☁️ Supabase bucket: {os.getenv('SUPABASE_BUCKET', 'documents')}")
+    logger.info(f"🌍 Environment: {os.getenv('ENVIRONMENT', 'development')}")
+    logger.info(f"🔧 Port: {os.getenv('PORT', '8080')}")
 
-    # Test services
+    # Test services with shorter timeout for Cloud Run
     if rag_llm_service.model:
         logger.info(f"✅ Gemini model ready: {rag_llm_service.model_name}")
     else:
@@ -1692,66 +1773,60 @@ async def startup_event():
 
     logger.info(f"✅ Embedding model ready: {EMBEDDING_MODEL_NAME} (dim: {vector_store.dimension})")
 
-    # Test Supabase connection properly with detailed logging
+    # Test Supabase connection with shorter timeout for Cloud Run startup
     logger.info("🔧 Testing Supabase Storage connection...")
     try:
+        # Use shorter timeout for Cloud Run
         supabase_manager = get_supabase_manager()
-        files = await supabase_manager.list_files()
-        logger.info(f"✅ Supabase Storage connected successfully - Found {len(files)} files")
-        logger.info("📦 Vector data will be stored in 'vectors/' folder")
-        logger.info("📄 Original documents will be stored in 'documents/' folder")
-
-        # Log first few files for debugging
-        if files:
-            logger.info("📋 Sample files in bucket:")
-            for i, file_info in enumerate(files[:5]):  # Show first 5 files
-                logger.info(f"   {i + 1}. {file_info.get('name', 'unknown')}")
-        else:
-            logger.info("📭 Bucket is empty (no files found)")
-
+        files = await asyncio.wait_for(supabase_manager.list_files(), timeout=10.0)
+        logger.info(f"✅ Supabase Storage connected - Found {len(files)} files")
+    except asyncio.TimeoutError:
+        logger.warning("⚠️ Supabase connection test timed out - continuing startup")
     except Exception as e:
-        logger.error(f"❌ Supabase Storage connection failed: {e}")
-        logger.error("🔧 Debug Info:")
-        logger.error(f"   SUPABASE_URL: {os.getenv('SUPABASE_URL')}")
-        logger.error(f"   SUPABASE_KEY: {'SET' if os.getenv('SUPABASE_KEY') else 'NOT_SET'}")
-        logger.error(f"   SUPABASE_BUCKET: {os.getenv('SUPABASE_BUCKET', 'documents')}")
-        logger.warning("Make sure SUPABASE_URL, SUPABASE_KEY, and SUPABASE_BUCKET are set correctly")
+        logger.warning(f"⚠️ Supabase Storage test failed: {e}")
+        logger.info("API will still start - Supabase will be tested on first request")
 
+    logger.info("✅ Cloud Run startup completed")
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("🛑 Shutting down RAG-Powered Document QA API")
+    """Cleanup on shutdown for Cloud Run"""
+    logger.info("🛑 Shutting down RAG-Powered Document QA API on Cloud Run")
+
+    # Clear memory caches to free up resources
+    if hasattr(vector_store, 'indexes'):
+        vector_store.indexes.clear()
+    if hasattr(vector_store, 'chunks'):
+        vector_store.chunks.clear()
+
     logger.info("📡 All data remains safely stored in Supabase")
+    logger.info("✅ Graceful shutdown completed")
 
 
+# Update the main execution block (replace the existing if __name__ == "__main__" block)
 if __name__ == "__main__":
     import uvicorn
 
-    # Get port from environment variable (important for Docker/cloud deployment)
-    port = int(os.getenv("PORT", 8000))
+    # Get port from environment variable (Cloud Run sets this automatically)
+    port = int(os.getenv("PORT", 8000))  # Cloud Run uses 8080 by default
+    host = "0.0.0.0"  # Must be 0.0.0.0 for Cloud Run
 
-    # Enhanced configuration for Docker
-    config = {
-        "app": "main:app",  # Use string format for better compatibility
-        "host": "0.0.0.0",  # Must be 0.0.0.0 for Docker
-        "port": port,
-        "log_level": "info",
-        "reload": False,  # Always False in production/Docker
-        "workers": 1,
-        "access_log": True,
-        "use_colors": False,  # Better for Docker logs
-        "loop": "asyncio"  # Specify event loop
-    }
-
-    print(f"🚀 Starting server on http://0.0.0.0:{port}")
+    print(f"🚀 Starting server on {host}:{port}")
+    print(f"☁️ Platform: Google Cloud Run")
     print("📡 Using FULL Supabase storage - NO local files")
 
+    # Simple uvicorn run for Cloud Run
     try:
-        uvicorn.run(**config)
+        uvicorn.run(
+            app,  # Use the app instance directly, not the string
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=True,
+            timeout_keep_alive=30,
+            loop="auto"
+        )
     except Exception as e:
-        print(f"❌ Server startup failed: {e}")
-        import sys
+        logger.error(f"❌ Server startup failed: {e}")
         sys.exit(1)
-        _create_rag_prompt

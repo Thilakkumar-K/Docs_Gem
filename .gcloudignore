@@ -1,0 +1,14 @@
+# Same as .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+ENV/
+.DS_Store
+Thumbs.db
+.git
+.gitignore
+.env
+.env.*

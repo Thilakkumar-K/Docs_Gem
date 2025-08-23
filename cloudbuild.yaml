@@ -1,0 +1,51 @@
+# Cloud Build configuration for automated CI/CD
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', 'gcr.io/$PROJECT_ID/rag-document-qa:$COMMIT_SHA',
+      '-t', 'gcr.io/$PROJECT_ID/rag-document-qa:latest',
+      '.'
+    ]
+
+  # Push the Docker image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/rag-document-qa:$COMMIT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/rag-document-qa:latest']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args: [
+      'run', 'deploy', 'rag-document-qa-api',
+      '--image', 'gcr.io/$PROJECT_ID/rag-document-qa:$COMMIT_SHA',
+      '--region', 'us-central1',
+      '--platform', 'managed',
+      '--allow-unauthenticated',
+      '--memory', '4Gi',
+      '--cpu', '2',
+      '--timeout', '900',
+      '--concurrency', '10',
+      '--min-instances', '0',
+      '--max-instances', '10',
+      '--port', '8080',
+      '--set-env-vars', 'PORT=8080,ENVIRONMENT=production,SUPABASE_BUCKET=documents,EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2,CHUNK_SIZE=2000,CHUNK_OVERLAP=200,TOP_K_RETRIEVAL=10,MAX_CONTEXT_LENGTH=10000',
+      '--set-secrets', 'GEMINI_API_KEY=gemini-api-key:latest,VALID_TOKEN=valid-token:latest,SUPABASE_URL=supabase-url:latest,SUPABASE_KEY=supabase-key:latest'
+    ]
+
+# Store images in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/rag-document-qa:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/rag-document-qa:latest'
+
+# Build options
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 100
+  substitution_option: 'ALLOW_LOOSE'
+
+# Timeout for the entire build
+timeout: '1800s'
