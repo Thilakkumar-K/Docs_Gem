@@ -184,6 +184,7 @@ class GlobalQueryRequest(BaseModel):
     query: str
     top_k: int = 10
     max_docs: int = 5
+    document_ids: Optional[List[str]] = None  # NEW: Filter by document IDs or filenames
 
     @field_validator('query')
     @classmethod
@@ -193,6 +194,16 @@ class GlobalQueryRequest(BaseModel):
         if len(v) > 500:
             raise ValueError("Query too long (max 500 characters)")
         return v.strip()
+
+    @field_validator('document_ids')
+    @classmethod
+    def validate_document_ids(cls, v):
+        if v is not None:
+            if len(v) == 0:
+                raise ValueError("document_ids cannot be empty if provided")
+            if len(v) > 20:
+                raise ValueError("Maximum 20 documents allowed per query")
+        return v
 
 
 
@@ -949,6 +960,71 @@ class VectorStore:
                 detail=f"Failed to perform global search: {str(e)}"
             )
 
+    async def search_filtered_documents(self, query: str, document_ids: List[str], top_k: int = 10) -> List[
+        Dict[str, Any]]:
+        """Search across specific documents by ID or filename"""
+        try:
+            logger.info(f"🔍 Filtered search: '{query[:50]}...' across {len(document_ids)} specified documents")
+
+            # Get all available documents
+            all_documents = await self.list_stored_documents()
+
+            if not all_documents:
+                logger.warning("No documents found in Supabase")
+                return []
+
+            # Filter documents by ID or filename
+            filtered_docs = []
+            for doc in all_documents:
+                doc_id = doc["document_id"]
+                file_name = doc.get("file_name", "unknown")
+
+                # Check if document matches any of the provided IDs or filenames
+                if (doc_id in document_ids or
+                        file_name in document_ids or
+                        any(doc_id.startswith(did) for did in document_ids if len(did) >= 8) or  # Partial ID match
+                        any(file_name.lower() == did.lower() for did in
+                            document_ids)):  # Case-insensitive filename match
+                    filtered_docs.append(doc)
+
+            if not filtered_docs:
+                logger.warning(f"No documents found matching IDs/filenames: {document_ids}")
+                return []
+
+            logger.info(f"📋 Found {len(filtered_docs)} matching documents: {[d['file_name'] for d in filtered_docs]}")
+
+            # Search each filtered document concurrently
+            search_tasks = []
+            for doc in filtered_docs:
+                task = self._search_single_document_with_metadata(doc, query, top_k)
+                search_tasks.append(task)
+
+            # Execute searches concurrently
+            results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+            # Merge and sort results
+            all_chunks = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Search failed for document {filtered_docs[i]['document_id']}: {result}")
+                    continue
+                all_chunks.extend(result)
+
+            # Sort by similarity score and return top_k
+            all_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
+            final_results = all_chunks[:top_k]
+
+            logger.info(
+                f"✅ Filtered search completed: {len(final_results)} results from {len(filtered_docs)} documents")
+            return final_results
+
+        except Exception as e:
+            logger.error(f"Error in filtered document search: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to perform filtered document search: {str(e)}"
+            )
+
     async def _search_single_document_with_metadata(self, doc_metadata: Dict[str, Any], query: str, top_k: int) -> List[
         Dict[str, Any]]:
         """Search a single document and add document metadata to results"""
@@ -1543,28 +1619,43 @@ async def global_query(
         request: GlobalQueryRequest,
         token: str = Depends(verify_token)
 ):
-    """Global search across all documents with RAG answer generation"""
+    """Global search across all documents or filtered documents with RAG answer generation"""
     try:
-        logger.info(f"🌍 Global query: '{request.query[:50]}...'")
-
-        # Search across all documents
-        relevant_chunks = await vector_store.search_across_documents(
-            request.query,
-            top_k=request.top_k,
-            max_docs=request.max_docs
-        )
+        if request.document_ids:
+            logger.info(f"🌐 Filtered query: '{request.query[:50]}...' across {len(request.document_ids)} specified documents")
+            # Search only specified documents
+            relevant_chunks = await vector_store.search_filtered_documents(
+                request.query,
+                request.document_ids,
+                top_k=request.top_k
+            )
+            search_type = "filtered"
+            documents_searched_info = f"Searched {len(request.document_ids)} specified documents"
+        else:
+            logger.info(f"🌐 Global query: '{request.query[:50]}...' across all documents")
+            # Search across all documents (existing behavior)
+            relevant_chunks = await vector_store.search_across_documents(
+                request.query,
+                top_k=request.top_k,
+                max_docs=request.max_docs
+            )
+            search_type = "global"
+            documents_searched_info = f"Searched up to {request.max_docs} documents"
 
         if not relevant_chunks:
+            search_scope = f"specified documents ({request.document_ids})" if request.document_ids else "all documents"
             return {
-                "answer": "No relevant information found across all documents.",
-                "sources": []
+                "answer": f"No relevant information found in {search_scope}.",
+                "sources": [],
+                "search_type": search_type,
+                "documents_searched": 0
             }
 
-        # Generate RAG answer using top chunks from multiple documents
+        # Generate RAG answer using top chunks from search
         answer_data = await rag_llm_service.generate_rag_answer(
             request.query,
             relevant_chunks,
-            "global_search"
+            "filtered_search" if request.document_ids else "global_search"
         )
 
         # Format sources with document info
@@ -1577,12 +1668,18 @@ async def global_query(
                 "similarity_score": chunk["similarity_score"]
             })
 
+        unique_doc_count = len(set(chunk["document_id"] for chunk in relevant_chunks))
+
         return {
             "answer": answer_data.get("answer", "No answer generated"),
             "sources": sources,
             "query": request.query,
+            "search_type": search_type,
             "chunks_searched": len(relevant_chunks),
-            "documents_searched": len(set(chunk["document_id"] for chunk in relevant_chunks))
+            "documents_searched": unique_doc_count,
+            "filter_applied": request.document_ids is not None,
+            "filtered_documents": request.document_ids if request.document_ids else None,
+            "search_info": documents_searched_info
         }
 
     except Exception as e:
@@ -2233,5 +2330,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Server startup failed: {e}")
         sys.exit(1)
-
-        list_stored_documents
