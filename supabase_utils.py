@@ -189,21 +189,46 @@ class SupabaseStorageManager:
             return False
 
     async def list_files(self, prefix: str = "") -> List[Dict[str, Any]]:
-        """List files in the bucket"""
+        """List files in the bucket with optional prefix"""
         try:
             logger.info(f"📋 Listing files with prefix: '{prefix}'")
             storage_bucket = self.supabase.storage.from_(self.bucket_name)
 
             if prefix:
+                # List files with specific prefix
                 response = storage_bucket.list(prefix)
             else:
+                # List all files in root
                 response = storage_bucket.list()
 
+            # Handle nested directory structure
+            all_files = []
             if response:
-                logger.info(f"✅ Found {len(response)} files")
-                return response
+                for item in response:
+                    # If it's a folder, recursively list its contents
+                    if item.get('id') is None and 'name' in item:
+                        # This is a folder - recursively get its contents
+                        folder_name = item['name']
+                        folder_prefix = f"{prefix}{folder_name}/" if prefix else f"{folder_name}/"
+                        try:
+                            folder_contents = storage_bucket.list(folder_prefix)
+                            if folder_contents:
+                                for subitem in folder_contents:
+                                    # Add full path
+                                    subitem['name'] = f"{folder_prefix}{subitem.get('name', '')}"
+                                    all_files.append(subitem)
+                        except Exception as e:
+                            logger.warning(f"Failed to list folder {folder_name}: {e}")
+                    else:
+                        # This is a file
+                        if prefix:
+                            item['name'] = f"{prefix}{item.get('name', '')}"
+                        all_files.append(item)
+
+                logger.info(f"✅ Found {len(all_files)} files")
+                return all_files
             else:
-                logger.info("📭 No files found")
+                logger.info("🔭 No files found")
                 return []
         except Exception as e:
             logger.error(f"❌ Failed to list files: {e}")
@@ -263,7 +288,7 @@ async def delete_file_from_supabase(file_path: str) -> bool:
     return await manager.delete_file_from_supabase(file_path)
 
 async def list_supabase_files(prefix: str = "") -> List[Dict[str, Any]]:
-    """List files in Supabase storage"""
+    """List files in Supabase storage with optional prefix"""
     manager = get_supabase_manager()
     return await manager.list_files(prefix)
 
@@ -315,3 +340,4 @@ async def test_supabase_upload_standalone():
     except Exception as e:
         logger.error(f"❌ Test failed: {e}")
         return False
+

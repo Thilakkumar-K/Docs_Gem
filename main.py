@@ -42,6 +42,9 @@ from sentence_transformers import SentenceTransformer
 import nltk
 from nltk.tokenize import sent_tokenize
 import re
+from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+import mimetypes
 
 # LLM integration (Google Generative AI)
 import google.generativeai as genai
@@ -127,9 +130,9 @@ VALID_TOKEN = os.getenv("VALID_TOKEN")
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Lightweight but effective
-CHUNK_SIZE = 2000  # Characters per chunk
+CHUNK_SIZE = 1500  # Characters per chunk
 CHUNK_OVERLAP = 200  # Overlap between chunks
-TOP_K_RETRIEVAL = 10  # Number of chunks to retrieve
+TOP_K_RETRIEVAL = 8  # Number of chunks to retrieve
 MAX_CONTEXT_LENGTH = 10000  # Max context for Gemini
 
 # DEBUG: Log all critical environment variables on startup
@@ -175,6 +178,22 @@ class DocumentQARequest(BaseModel):
         if len(v) > 10:
             raise ValueError("Maximum 10 questions allowed per request")
         return v
+
+
+class GlobalQueryRequest(BaseModel):
+    query: str
+    top_k: int = 10
+    max_docs: int = 5
+
+    @field_validator('query')
+    @classmethod
+    def validate_query(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Query cannot be empty")
+        if len(v) > 500:
+            raise ValueError("Query too long (max 500 characters)")
+        return v.strip()
+
 
 
 class DocumentUploadResponse(BaseModel):
@@ -390,33 +409,36 @@ class DocumentProcessor:
         return text.strip()
 
     @classmethod
-    async def process_document_from_source(cls, source: str) -> tuple[str, str]:
-        """Process document from URL or Supabase storage and return text with document ID"""
+    async def process_document_from_source(cls, source: str, source_type: str = "auto") -> tuple[str, str, str]:
+        """Process document from URL or Supabase storage and return text, document ID, and filename"""
         # Generate document ID based on source
         doc_id = hashlib.md5(source.encode()).hexdigest()
 
-        # Download document content
-        content, source_type = await download_document_content(source)
+        # Determine source type
+        if source_type == "auto":
+            if GoogleDriveProcessor.is_google_drive_link(source):
+                source_type = "google_drive"
+            elif source.startswith(('http://', 'https://')):
+                source_type = "url"
+            else:
+                source_type = "supabase_path"
 
-        logger.info(f"Processing document from {source_type}: {len(content)} bytes")
+        # Handle Google Drive links
+        if source_type == "google_drive":
+            # Convert to direct download URL
+            direct_url = GoogleDriveProcessor.convert_to_direct_download(source)
+            source = direct_url
+
+        # Download document content
+        content, _ = await download_document_content(source)
+
+        # Extract filename from URL or use default
+        filename = cls._extract_filename_from_url(source) if source.startswith('http') else source.split('/')[-1]
+
+        logger.info(f"Processing document from {source_type}: {filename} ({len(content)} bytes)")
 
         # Determine file type and extract text
-        source_lower = source.lower()
-
-        if '.pdf' in source_lower or content.startswith(b'%PDF'):
-            text = cls.extract_text_from_pdf(content)
-        elif '.docx' in source_lower or content.startswith(b'PK'):
-            text = cls.extract_text_from_docx(content)
-        elif '.eml' in source_lower or b'From:' in content[:1000]:
-            text = cls.extract_text_from_email(content)
-        else:
-            try:
-                text = content.decode('utf-8', errors='ignore')
-            except Exception:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Unsupported document format. Supported: PDF, DOCX, EML, TXT"
-                )
+        text = await cls._extract_text_by_content_type(content, source, filename)
 
         if not text.strip():
             raise HTTPException(
@@ -424,8 +446,55 @@ class DocumentProcessor:
                 detail="Document appears to be empty or contains no extractable text"
             )
 
-        return text, doc_id
+        return text, doc_id, filename
 
+    @staticmethod
+    def _extract_filename_from_url(url: str) -> str:
+        """Extract filename from URL"""
+        try:
+            parsed = urlparse(url)
+            filename = Path(parsed.path).name
+            if filename and '.' in filename:
+                return filename
+
+            # Fallback for URLs without clear filename
+            if 'drive.google.com' in url:
+                return f"google_drive_document.pdf"
+            else:
+                return f"document_{int(time.time())}.pdf"
+        except:
+            return f"document_{int(time.time())}.pdf"
+
+    @classmethod
+    async def _extract_text_by_content_type(cls, content: bytes, source: str, filename: str) -> str:
+        """Extract text based on content type detection"""
+        source_lower = source.lower()
+        filename_lower = filename.lower()
+
+        # Detect by content signature first
+        if content.startswith(b'%PDF'):
+            return cls.extract_text_from_pdf(content)
+        elif content.startswith(b'PK'):  # ZIP-based formats like DOCX
+            return cls.extract_text_from_docx(content)
+        elif b'From:' in content[:1000] or b'Subject:' in content[:1000]:
+            return cls.extract_text_from_email(content)
+
+        # Fallback to file extension
+        if any(ext in filename_lower for ext in ['.pdf']) or 'pdf' in source_lower:
+            return cls.extract_text_from_pdf(content)
+        elif any(ext in filename_lower for ext in ['.docx', '.doc']) or 'docx' in source_lower:
+            return cls.extract_text_from_docx(content)
+        elif '.eml' in filename_lower:
+            return cls.extract_text_from_email(content)
+        else:
+            # Try as plain text
+            try:
+                return content.decode('utf-8', errors='ignore')
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Unsupported document format. Supported: PDF, DOCX, EML, TXT"
+                )
     @classmethod
     async def process_uploaded_file(cls, content: bytes, filename: str) -> str:
         """Process uploaded file content and return extracted text"""
@@ -458,6 +527,98 @@ class DocumentProcessor:
         return text
 
 
+class GoogleDriveProcessor:
+    """Handle Google Drive folder and file processing"""
+
+    @staticmethod
+    def is_google_drive_link(url: str) -> bool:
+        """Check if URL is a Google Drive link"""
+        return 'drive.google.com' in url or 'docs.google.com' in url
+
+    @staticmethod
+    def extract_folder_id(url: str) -> str:
+        """Extract folder ID from Google Drive URL"""
+        patterns = [
+            r'/folders/([a-zA-Z0-9-_]+)',
+            r'id=([a-zA-Z0-9-_]+)',
+            r'/d/([a-zA-Z0-9-_]+)'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        raise ValueError("Could not extract folder ID from Google Drive URL")
+
+    @staticmethod
+    async def get_drive_folder_files(folder_url: str) -> List[Dict[str, str]]:
+        """Get list of files from Google Drive folder using export links"""
+        try:
+            folder_id = GoogleDriveProcessor.extract_folder_id(folder_url)
+            logger.info(f"Processing Google Drive folder: {folder_id}")
+
+            # Create export URL for folder listing (this is a simplified approach)
+            # In production, you'd use Google Drive API for better reliability
+            export_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                response = await client.get(export_url)
+                response.raise_for_status()
+
+                # Parse HTML to extract file links (simplified approach)
+                content = response.text
+
+                # Look for file patterns in the HTML
+                file_patterns = [
+                    r'href="([^"]*)/file/d/([^/]*)/[^"]*"[^>]*>([^<]*\.(pdf|docx|txt|eml))</i>',
+                    r'"([^"]*\.(pdf|docx|txt|eml))"'
+                ]
+
+                files = []
+                # This is a simplified parser - in production use proper Google Drive API
+                for match in re.finditer(r'/file/d/([a-zA-Z0-9-_]+)', content):
+                    file_id = match.group(1)
+                    # Create direct download link
+                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                    files.append({
+                        "file_id": file_id,
+                        "download_url": download_url,
+                        "filename": f"file_{file_id}.pdf"  # Default, will be updated
+                    })
+
+                logger.info(f"Found {len(files)} files in Google Drive folder")
+                return files
+
+        except Exception as e:
+            logger.error(f"Error processing Google Drive folder: {e}")
+            # Fallback: treat as single file
+            return [{
+                "file_id": "single_file",
+                "download_url": folder_url,
+                "filename": "document.pdf"
+            }]
+
+    @staticmethod
+    def convert_to_direct_download(url: str) -> str:
+        """Convert Google Drive share URL to direct download URL"""
+        if '/file/d/' in url:
+            file_id_match = re.search(r'/file/d/([a-zA-Z0-9-_]+)', url)
+            if file_id_match:
+                file_id = file_id_match.group(1)
+                return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        if 'id=' in url:
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            if 'id' in params:
+                file_id = params['id'][0]
+                return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        return url
+
+
 class VectorStore:
     """FAISS-based vector store with direct Supabase storage - NO BUFFER/CACHE"""
 
@@ -470,7 +631,8 @@ class VectorStore:
         logger.info(f"✅ Initialized vector store with {EMBEDDING_MODEL_NAME} (dim: {self.dimension})")
         logger.info("🚫 NO BUFFER MODE - All data stored directly in Supabase")
 
-    async def create_embeddings(self, document_id: str, chunks: List[Dict[str, Any]]) -> int:
+    async def create_embeddings(self, document_id: str, chunks: List[Dict[str, Any]],
+                                file_name: str = None, source_info: Dict[str, Any] = None) -> int:
         """Create embeddings and store directly in Supabase - NO BUFFER"""
         try:
             logger.info(f"Creating embeddings for {len(chunks)} chunks - DIRECT TO SUPABASE")
@@ -497,9 +659,9 @@ class VectorStore:
             index.add(embeddings)
 
             # Save DIRECTLY to Supabase (no buffer storage)
-            await self._save_to_supabase_direct(document_id, embeddings, chunks)
+            await self._save_to_supabase_direct(document_id, embeddings, chunks, file_name, source_info)
 
-            logger.info(f"✅ Created and saved {len(chunks)} vectors directly to Supabase")
+            logger.info(f"Created and saved {len(chunks)} vectors directly to Supabase")
             return len(chunks)
 
         except Exception as e:
@@ -552,10 +714,11 @@ class VectorStore:
                 detail=f"Failed to search chunks: {str(e)}"
             )
 
-    async def _save_to_supabase_direct(self, document_id: str, embeddings: np.ndarray, chunks: List[Dict[str, Any]]):
+    async def _save_to_supabase_direct(self, document_id: str, embeddings: np.ndarray, chunks: List[Dict[str, Any]],
+                                       file_name: str = None, source_info: Dict[str, Any] = None):
         """Save embeddings and chunks directly to Supabase as separate files"""
         try:
-            logger.info(f"💾 Saving vector data directly to Supabase for {document_id}")
+            logger.info(f"Saving vector data directly to Supabase for {document_id}")
 
             # Save embeddings as numpy array
             embeddings_bytes = io.BytesIO()
@@ -571,21 +734,23 @@ class VectorStore:
             chunks_path = f"vectors/{document_id}/chunks.json"
             await upload_file_to_supabase(chunks_path, chunks_bytes)
 
-            # Save metadata
+            # Save enhanced metadata
             metadata = {
                 "document_id": document_id,
                 "chunks_count": len(chunks),
                 "embedding_model": EMBEDDING_MODEL_NAME,
                 "dimension": self.dimension,
                 "created_at": time.time(),
-                "total_characters": sum(chunk["char_count"] for chunk in chunks)
+                "total_characters": sum(chunk["char_count"] for chunk in chunks),
+                "file_name": file_name,
+                "source_info": source_info or {}  # NEW: Store source information
             }
             metadata_json = json.dumps(metadata, indent=2)
             metadata_bytes = metadata_json.encode('utf-8')
             metadata_path = f"vectors/{document_id}/metadata.json"
             await upload_file_to_supabase(metadata_path, metadata_bytes)
 
-            logger.info(f"✅ Saved vector data directly to Supabase: {embeddings_path}, {chunks_path}, {metadata_path}")
+            logger.info(f"Saved vector data directly to Supabase: {embeddings_path}, {chunks_path}, {metadata_path}")
 
         except Exception as e:
             logger.error(f"Error saving to Supabase: {e}")
@@ -667,33 +832,48 @@ class VectorStore:
     async def list_stored_documents(self) -> List[Dict[str, Any]]:
         """List all documents with vector data in Supabase"""
         try:
-            files = await list_supabase_files()
+            # List files specifically in the vectors/ directory
+            files = await list_supabase_files(prefix="vectors/")
 
             documents = []
+            seen_doc_ids = set()
+
             for file_info in files:
                 file_path = file_info.get('name', '')
+
+                # Look for metadata.json files in vectors/doc_id/metadata.json pattern
                 if file_path.startswith('vectors/') and file_path.endswith('/metadata.json'):
                     try:
-                        document_id = file_path.split('/')[1]
+                        # Extract document_id from path: vectors/{doc_id}/metadata.json
+                        path_parts = file_path.split('/')
+                        if len(path_parts) >= 3:
+                            document_id = path_parts[1]
 
-                        # Load metadata
-                        metadata_bytes = await download_file_from_supabase(file_path)
-                        metadata = json.loads(metadata_bytes.decode('utf-8'))
+                            # Skip if we've already processed this document
+                            if document_id in seen_doc_ids:
+                                continue
+                            seen_doc_ids.add(document_id)
 
-                        documents.append({
-                            "document_id": document_id,
-                            "chunks_count": metadata.get("chunks_count", 0),
-                            "total_characters": metadata.get("total_characters", 0),
-                            "embedding_model": metadata.get("embedding_model", "unknown"),
-                            "created_at": metadata.get("created_at", 0),
-                            "status": "stored_in_supabase",
-                            "supabase_path": f"vectors/{document_id}/"
-                        })
+                            # Load metadata
+                            metadata_bytes = await download_file_from_supabase(file_path)
+                            metadata = json.loads(metadata_bytes.decode('utf-8'))
+
+                            documents.append({
+                                "document_id": document_id,
+                                "file_name": metadata.get("file_name", "unknown"),
+                                "chunks_count": metadata.get("chunks_count", 0),
+                                "total_characters": metadata.get("total_characters", 0),
+                                "embedding_model": metadata.get("embedding_model", "unknown"),
+                                "created_at": metadata.get("created_at", 0),
+                                "status": "stored_in_supabase",
+                                "supabase_path": f"vectors/{document_id}/"
+                            })
+
                     except Exception as e:
                         logger.warning(f"Failed to process metadata file {file_path}: {e}")
                         continue
 
-            logger.info(f"Found {len(documents)} documents in Supabase")
+            logger.info(f"Found {len(documents)} documents in Supabase vectors/ directory")
             return documents
 
         except Exception as e:
@@ -715,6 +895,101 @@ class VectorStore:
                 detail=f"Chunks not found for document {document_id}"
             )
 
+    async def search_across_documents(self, query: str, top_k: int = 10, max_docs: int = 5) -> List[Dict[str, Any]]:
+        """Search across all documents stored in Supabase"""
+        try:
+            logger.info(f"🔍 Global search: '{query[:50]}...' across max {max_docs} documents")
+
+            # Get all available documents
+            all_documents = await self.list_stored_documents()
+
+            if not all_documents:
+                logger.warning("No documents found in Supabase")
+                return []
+
+            # Shortlist documents (simple heuristic: by recent creation + character count)
+            shortlisted_docs = sorted(
+                all_documents,
+                key=lambda x: (x.get('created_at', 0), x.get('total_characters', 0)),
+                reverse=True
+            )[:max_docs]
+
+            logger.info(
+                f"📋 Shortlisted {len(shortlisted_docs)} documents: {[d['document_id'][:8] for d in shortlisted_docs]}")
+
+            # Search each document concurrently
+            search_tasks = []
+            for doc in shortlisted_docs:
+                task = self._search_single_document_with_metadata(doc, query, top_k)
+                search_tasks.append(task)
+
+            # Execute searches concurrently
+            results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+            # Merge and sort results
+            all_chunks = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Search failed for document {shortlisted_docs[i]['document_id']}: {result}")
+                    continue
+                all_chunks.extend(result)
+
+            # Sort by similarity score and return top_k
+            all_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
+            final_results = all_chunks[:top_k]
+
+            logger.info(
+                f"✅ Global search completed: {len(final_results)} results from {len(shortlisted_docs)} documents")
+            return final_results
+
+        except Exception as e:
+            logger.error(f"Error in global search: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to perform global search: {str(e)}"
+            )
+
+    async def _search_single_document_with_metadata(self, doc_metadata: Dict[str, Any], query: str, top_k: int) -> List[
+        Dict[str, Any]]:
+        """Search a single document and add document metadata to results"""
+        try:
+            document_id = doc_metadata['document_id']
+
+            # Load embeddings and chunks
+            embeddings, chunks = await self._load_from_supabase_direct(document_id)
+
+            # Create temporary FAISS index
+            index = faiss.IndexFlatIP(self.dimension)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+
+            # Generate query embedding
+            query_embedding = self.embedding_model.encode([query])
+            query_embedding = query_embedding.astype('float32')
+            faiss.normalize_L2(query_embedding)
+
+            # Search
+            scores, indices = index.search(query_embedding, min(top_k, index.ntotal))
+
+            # Build results with document metadata
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx != -1 and score > 0.3:  # Minimum similarity threshold
+                    chunk = chunks[idx].copy()
+                    chunk.update({
+                        "similarity_score": float(score),
+                        "document_id": document_id,
+                        "file_name": doc_metadata.get('file_name', 'unknown'),
+                        "chunk_preview": chunk["text"][:150] + "..." if len(chunk["text"]) > 150 else chunk["text"]
+                    })
+                    results.append(chunk)
+
+            logger.info(f"📄 Found {len(results)} relevant chunks in {doc_metadata.get('file_name', document_id[:8])}")
+            return results
+
+        except Exception as e:
+            logger.warning(f"Failed to search document {document_id}: {e}")
+            return []
 
 
 class RAGLLMService:
@@ -911,10 +1186,53 @@ class RAGLLMService:
         confidence = total_score / total_weight if total_weight > 0 else 0.0
         return min(confidence, 1.0)
 
+class DocumentIngestRequest(BaseModel):
+    source: str  # URL, Google Drive link, or direct document link
+    source_type: Optional[str] = "auto"  # auto, url, google_drive, direct_link
+    folder_name: Optional[str] = None  # For organizing multiple documents
+
+    @field_validator('source')
+    @classmethod
+    def validate_source(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Source cannot be empty")
+        return v.strip()
+
 
 # Initialize services
 vector_store = VectorStore()
 rag_llm_service = RAGLLMService()
+
+
+# Replace the root endpoint (around line 280) with this enhanced version:
+
+@app.get("/")
+async def list_all_documents():
+    """Root endpoint - List all available documents"""
+    try:
+        logger.info("Fetching all documents from Supabase...")
+
+        # Get all documents from vector store
+        documents = await vector_store.list_stored_documents()
+
+        # Format documents in the requested format
+        formatted_docs = []
+        for doc in documents:
+            formatted_docs.append({
+                "document_id": doc["document_id"],
+                "file_name": doc.get("file_name", "unknown"),
+                "chunks_count": doc.get("chunks_count", 0),
+                "created_at": int(doc.get("created_at", 0))
+            })
+
+        return formatted_docs
+
+    except Exception as e:
+        logger.error(f"Error fetching documents: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch documents: {str(e)}"
+        )
 
 
 # API Routes
@@ -957,6 +1275,7 @@ async def health_check():
         }
     }
 
+
 @app.post("/api/v1/documents/upload")
 async def upload_document(
         file: UploadFile = File(...),
@@ -981,7 +1300,7 @@ async def upload_document(
         timestamp = int(time.time())
         safe_filename = file.filename.replace(" ", "_").replace("/", "_")
         supabase_file_path = f"documents/{document_id}_{timestamp}_{safe_filename}"
-        logger.info(f"📍 Supabase file path: {supabase_file_path}")
+        logger.info(f"📁 Supabase file path: {supabase_file_path}")
 
         # Read file content
         logger.info("📖 Reading file content...")
@@ -1015,7 +1334,7 @@ async def upload_document(
             public_url = None
 
         # Process document content
-        logger.info("🔤 Processing document text...")
+        logger.info("📤 Processing document text...")
         processor = DocumentProcessor()
         text = await processor.process_uploaded_file(content, file.filename)
         logger.info(f"✅ Text extracted: {len(text)} characters")
@@ -1025,16 +1344,29 @@ async def upload_document(
         chunks = processor.intelligent_chunking(text)
         logger.info(f"✅ Created {len(chunks)} chunks")
 
-        # Create embeddings and vector index (stored in Supabase)
+        # Create embeddings and vector index (stored in Supabase) - UPDATED
         logger.info("🧠 Creating embeddings and saving to Supabase...")
-        chunks_created = await vector_store.create_embeddings(document_id, chunks)
+
+        # Create source info with enhanced metadata - UPDATED
+        source_info = {
+            "source_type": "file_upload",
+            "upload_timestamp": timestamp,
+            "original_content_type": file.content_type,
+            "original_filename": file.filename,
+            "supabase_path": uploaded_path,
+            "file_size_bytes": len(content),
+            "ingested_at": time.time(),
+            "upload_method": "multipart_form"
+        }
+
+        chunks_created = await vector_store.create_embeddings(document_id, chunks, file.filename, source_info)
         logger.info(f"✅ Created and stored {chunks_created} embeddings in Supabase")
 
         logger.info("=" * 100)
         logger.info("✅ DOCUMENT UPLOAD COMPLETED SUCCESSFULLY!")
         logger.info(f"   📄 Document ID: {document_id}")
         logger.info(f"   📁 Filename: {file.filename}")
-        logger.info(f"   📍 Supabase path: {uploaded_path}")
+        logger.info(f"   📁 Supabase path: {uploaded_path}")
         logger.info(f"   🧩 Chunks created: {chunks_created}")
         logger.info(f"   🔗 Public URL: {public_url or 'Not generated'}")
         logger.info("=" * 100)
@@ -1066,6 +1398,200 @@ async def upload_document(
             detail=f"Failed to process document: {str(e)}"
         )
 
+@app.post("/api/v1/documents/ingest-link")
+async def ingest_document_link(
+        request: DocumentIngestRequest,
+        token: str = Depends(verify_token)
+):
+    """Ingest documents from URL or Google Drive folder"""
+    try:
+        logger.info(f"Ingesting from source: {request.source}")
+
+        # Check if it's a Google Drive folder
+        if GoogleDriveProcessor.is_google_drive_link(request.source) and '/folders/' in request.source:
+            return await _ingest_google_drive_folder(request)
+        else:
+            return await _ingest_single_document(request)
+
+    except Exception as e:
+        logger.error(f"Error ingesting document link: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to ingest document: {str(e)}"
+        )
+
+
+async def _ingest_single_document(request: DocumentIngestRequest) -> Dict[str, Any]:
+    """Ingest a single document from URL"""
+    # Extract text and get document info
+    text, document_id, filename = await DocumentProcessor.process_document_from_source(
+        request.source, request.source_type
+    )
+
+    # Check if document already exists in Supabase
+    try:
+        await vector_store._load_from_supabase_direct(document_id)
+        logger.info(f"Found existing vector data for document {document_id}")
+
+        return {
+            "document_id": document_id,
+            "filename": filename,
+            "status": "already_processed",
+            "source": request.source,
+            "message": "Document already exists in vector store"
+        }
+
+    except HTTPException:
+        # Document not found, create new one
+        logger.info(f"Creating new vector index for document {document_id}")
+
+        # Create chunks
+        chunks = DocumentProcessor.intelligent_chunking(text)
+
+        # Prepare source info
+        source_info = {
+            "source_url": request.source,
+            "source_type": request.source_type or "auto",
+            "folder_name": request.folder_name,
+            "ingested_at": time.time()
+        }
+
+        # Create embeddings and store
+        chunks_created = await vector_store.create_embeddings(
+            document_id, chunks, filename, source_info
+        )
+
+        return {
+            "document_id": document_id,
+            "filename": filename,
+            "status": "processed",
+            "chunks_created": chunks_created,
+            "source": request.source,
+            "source_info": source_info,
+            "message": f"Document processed successfully with {chunks_created} chunks"
+        }
+
+
+async def _ingest_google_drive_folder(request: DocumentIngestRequest) -> Dict[str, Any]:
+    """Ingest all documents from Google Drive folder"""
+    try:
+        # Get list of files in folder
+        files = await GoogleDriveProcessor.get_drive_folder_files(request.source)
+
+        if not files:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No files found in Google Drive folder"
+            )
+
+        results = []
+        successful = 0
+        failed = 0
+
+        for file_info in files:
+            try:
+                # Create individual ingest request
+                file_request = DocumentIngestRequest(
+                    source=file_info["download_url"],
+                    source_type="google_drive",
+                    folder_name=request.folder_name or "Google Drive Folder"
+                )
+
+                # Ingest individual file
+                result = await _ingest_single_document(file_request)
+                result["original_file_info"] = file_info
+                results.append(result)
+
+                if result["status"] in ["processed", "already_processed"]:
+                    successful += 1
+                else:
+                    failed += 1
+
+                # Rate limiting
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Failed to process file {file_info.get('filename', 'unknown')}: {e}")
+                results.append({
+                    "filename": file_info.get("filename", "unknown"),
+                    "status": "failed",
+                    "error": str(e),
+                    "original_file_info": file_info
+                })
+                failed += 1
+
+        return {
+            "folder_url": request.source,
+            "total_files": len(files),
+            "successful": successful,
+            "failed": failed,
+            "folder_name": request.folder_name or "Google Drive Folder",
+            "results": results,
+            "message": f"Processed {successful}/{len(files)} files successfully"
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing Google Drive folder: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process Google Drive folder: {str(e)}"
+        )
+
+
+@app.post("/api/v1/query/global")
+async def global_query(
+        request: GlobalQueryRequest,
+        token: str = Depends(verify_token)
+):
+    """Global search across all documents with RAG answer generation"""
+    try:
+        logger.info(f"🌍 Global query: '{request.query[:50]}...'")
+
+        # Search across all documents
+        relevant_chunks = await vector_store.search_across_documents(
+            request.query,
+            top_k=request.top_k,
+            max_docs=request.max_docs
+        )
+
+        if not relevant_chunks:
+            return {
+                "answer": "No relevant information found across all documents.",
+                "sources": []
+            }
+
+        # Generate RAG answer using top chunks from multiple documents
+        answer_data = await rag_llm_service.generate_rag_answer(
+            request.query,
+            relevant_chunks,
+            "global_search"
+        )
+
+        # Format sources with document info
+        sources = []
+        for chunk in relevant_chunks[:5]:  # Top 5 sources
+            sources.append({
+                "document_id": chunk["document_id"],
+                "file_name": chunk.get("file_name", "unknown"),
+                "chunk_preview": chunk.get("chunk_preview", chunk["text"][:150] + "..."),
+                "similarity_score": chunk["similarity_score"]
+            })
+
+        return {
+            "answer": answer_data.get("answer", "No answer generated"),
+            "sources": sources,
+            "query": request.query,
+            "chunks_searched": len(relevant_chunks),
+            "documents_searched": len(set(chunk["document_id"] for chunk in relevant_chunks))
+        }
+
+    except Exception as e:
+        logger.error(f"Error in global query: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process global query: {str(e)}"
+        )
+
 
 @app.post(
     "/api/v1/hackrx/run",
@@ -1090,20 +1616,29 @@ async def process_document_qa_rag(
         if request.documents and not request.document_id:
             logger.info(f"Processing document from source: {request.documents}")
 
-            # Extract text and get document ID
-            text, document_id = await DocumentProcessor.process_document_from_source(request.documents)
+            # Extract text and get document ID with filename - UPDATED
+            text, document_id, filename = await DocumentProcessor.process_document_from_source(request.documents)
 
             # Check if we already have this document processed in Supabase
             try:
                 # Try to load from Supabase to see if it exists
                 await vector_store._load_from_supabase_direct(document_id)
-                logger.info(f"✅ Found existing vector data in Supabase for document {document_id}")
+                logger.info(f"Found existing vector data in Supabase for document {document_id}")
             except HTTPException:
                 # Document not found in Supabase, create new one
-                logger.info(f"📝 Creating new vector index for document {document_id}")
+                logger.info(f"Creating new vector index for document {document_id}")
                 chunks = DocumentProcessor.intelligent_chunking(text)
-                await vector_store.create_embeddings(document_id, chunks)
-                logger.info(f"✅ Created new vector index in Supabase for document {document_id}")
+
+                # Create source info - UPDATED
+                source_info = {
+                    "source_url": request.documents,
+                    "source_type": "api_request",
+                    "processed_via": "hackrx_endpoint",
+                    "ingested_at": time.time()
+                }
+
+                await vector_store.create_embeddings(document_id, chunks, filename, source_info)
+                logger.info(f"Created new vector index in Supabase for document {document_id}")
 
         elif request.document_id:
             document_id = request.document_id
@@ -1673,13 +2208,12 @@ async def shutdown_event():
     logger.info("✅ Graceful shutdown completed")
 
 
-# Update the main execution block (replace the existing if __name__ == "__main__" block)
+
 if __name__ == "__main__":
     import uvicorn
 
-    # Get port from environment variable (Cloud Run sets this automatically)
-    port = int(os.getenv("PORT", 8000))  # Cloud Run uses 8080 by default
-    host = "0.0.0.0"  # Must be 0.0.0.0 for Cloud Run
+    port = int(os.getenv("PORT", 8000))
+    host = "0.0.0.0"
 
     print(f"🚀 Starting server on {host}:{port}")
     print(f"☁️ Platform: Google Cloud Run")
@@ -1699,3 +2233,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Server startup failed: {e}")
         sys.exit(1)
+
+        list_stored_documents
