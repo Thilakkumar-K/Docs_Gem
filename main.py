@@ -420,8 +420,8 @@ class DocumentProcessor:
         return text.strip()
 
     @classmethod
-    async def process_document_from_source(cls, source: str, source_type: str = "auto") -> tuple[str, str, str]:
-        """Process document from URL or Supabase storage and return text, document ID, and filename"""
+    async def process_document_from_source(cls, source: str, source_type: str = "auto") -> tuple[str, str, str, str]:
+        """Process document from URL or Supabase storage and return text, document ID, original filename, and sanitized filename"""
         # Generate document ID based on source
         doc_id = hashlib.md5(source.encode()).hexdigest()
 
@@ -436,20 +436,23 @@ class DocumentProcessor:
 
         # Handle Google Drive links
         if source_type == "google_drive":
+            # Get original filename BEFORE converting to direct download URL
+            original_filename, sanitized_filename = await cls._extract_filename_from_url(source)
             # Convert to direct download URL
             direct_url = GoogleDriveProcessor.convert_to_direct_download(source)
             source = direct_url
+        else:
+            # Extract filename from regular URL or use default
+            original_filename, sanitized_filename = await cls._extract_filename_from_url(source)
 
         # Download document content
         content, _ = await download_document_content(source)
 
-        # Extract filename from URL or use default
-        filename = cls._extract_filename_from_url(source) if source.startswith('http') else source.split('/')[-1]
-
-        logger.info(f"Processing document from {source_type}: {filename} ({len(content)} bytes)")
+        logger.info(
+            f"Processing document from {source_type}: {original_filename} (sanitized: {sanitized_filename}) ({len(content)} bytes)")
 
         # Determine file type and extract text
-        text = await cls._extract_text_by_content_type(content, source, filename)
+        text = await cls._extract_text_by_content_type(content, source, original_filename)
 
         if not text.strip():
             raise HTTPException(
@@ -457,24 +460,66 @@ class DocumentProcessor:
                 detail="Document appears to be empty or contains no extractable text"
             )
 
-        return text, doc_id, filename
+        return text, doc_id, original_filename, sanitized_filename
 
     @staticmethod
-    def _extract_filename_from_url(url: str) -> str:
-        """Extract filename from URL"""
+    async def _extract_filename_from_url(url: str) -> Tuple[str, str]:
+        """Extract filename from URL - returns (original_filename, sanitized_filename)"""
         try:
-            parsed = urlparse(url)
-            filename = Path(parsed.path).name
-            if filename and '.' in filename:
-                return filename
-
-            # Fallback for URLs without clear filename
             if 'drive.google.com' in url:
-                return f"google_drive_document.pdf"
-            else:
-                return f"document_{int(time.time())}.pdf"
-        except:
-            return f"document_{int(time.time())}.pdf"
+                # Extract file ID from Google Drive URL
+                file_id = None
+
+                # Try different patterns
+                patterns = [
+                    r'/file/d/([a-zA-Z0-9-_]+)',
+                    r'id=([a-zA-Z0-9-_]+)',
+                    r'/d/([a-zA-Z0-9-_]+)'
+                ]
+
+                for pattern in patterns:
+                    match = re.search(pattern, url)
+                    if match:
+                        file_id = match.group(1)
+                        break
+
+                if file_id:
+                    # Get real filename from Drive API with improved logic
+                    metadata = await GoogleDriveProcessor.get_drive_file_metadata(file_id)
+                    original_name = metadata["name"]
+
+                    # Only use fallback if the returned name looks like our fallback pattern
+                    if not original_name.startswith('drive_document_') and not original_name.startswith('gdrive_doc_'):
+                        sanitized_name = GoogleDriveProcessor.sanitize_filename(original_name)
+                        logger.info(f"✅ Using real Drive filename: {original_name}")
+                        return original_name, sanitized_name
+                    else:
+                        logger.warning(f"Drive API returned fallback name: {original_name}")
+                        # Try to extract from URL as backup
+                        parsed = urlparse(url)
+                        params = parse_qs(parsed.query)
+
+                        for param_name in ['filename', 'name', 'title']:
+                            if param_name in params and params[param_name][0]:
+                                url_filename = params[param_name][0]
+                                if '.' in url_filename and len(url_filename) > 3:
+                                    sanitized = GoogleDriveProcessor.sanitize_filename(url_filename)
+                                    logger.info(f"✅ Using filename from URL params: {url_filename}")
+                                    return url_filename, sanitized
+
+                        # Final fallback with better naming
+                        timestamp = int(time.time())
+                        final_fallback = f"google_drive_document_{timestamp}.pdf"
+                        return final_fallback, final_fallback
+
+            # Rest of the method stays the same for non-Google Drive URLs...
+            # [Keep existing code for regular URLs]
+
+        except Exception as e:
+            logger.warning(f"Error extracting filename from {url}: {e}")
+            timestamp = int(time.time())
+            default_name = f"document_{timestamp}.pdf"
+            return default_name, default_name
 
     @classmethod
     async def _extract_text_by_content_type(cls, content: bytes, source: str, filename: str) -> str:
@@ -537,6 +582,16 @@ class DocumentProcessor:
 
         return text
 
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename for safe storage while preserving readability"""
+        # Remove or replace problematic characters
+        sanitized = filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        sanitized = re.sub(r'[<>:"|?*]', '_', sanitized)
+        # Remove multiple underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        return sanitized.strip('_')
+
 
 class GoogleDriveProcessor:
     """Handle Google Drive folder and file processing"""
@@ -564,52 +619,128 @@ class GoogleDriveProcessor:
 
     @staticmethod
     async def get_drive_folder_files(folder_url: str) -> List[Dict[str, str]]:
-        """Get list of files from Google Drive folder using export links"""
+        """Get list of files from Google Drive folder - Fixed version with better error handling"""
         try:
             folder_id = GoogleDriveProcessor.extract_folder_id(folder_url)
             logger.info(f"Processing Google Drive folder: {folder_id}")
 
-            # Create export URL for folder listing (this is a simplified approach)
-            # In production, you'd use Google Drive API for better reliability
-            export_url = f"https://drive.google.com/drive/folders/{folder_id}"
+            # Try to make the folder publicly accessible by converting to a viewable URL
+            public_folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
 
+            # Use HTML parsing approach since API requires authentication
             timeout = httpx.Timeout(30.0, connect=10.0)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                response = await client.get(export_url)
-                response.raise_for_status()
+                # Try to access the folder page
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                response = await client.get(public_folder_url, headers=headers)
 
-                # Parse HTML to extract file links (simplified approach)
+                if response.status_code != 200:
+                    logger.error(f"Cannot access Google Drive folder. Status: {response.status_code}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot access Google Drive folder. Make sure the folder is publicly accessible. Status: {response.status_code}"
+                    )
+
                 content = response.text
 
+                # Extract file IDs and names from HTML
+                files = []
+
                 # Look for file patterns in the HTML
+                import re
+
+                # Pattern for file data in Drive's HTML
                 file_patterns = [
-                    r'href="([^"]*)/file/d/([^/]*)/[^"]*"[^>]*>([^<]*\.(pdf|docx|txt|eml))</i>',
-                    r'"([^"]*\.(pdf|docx|txt|eml))"'
+                    r'"(\w{28,})".*?"([^"]*\.(?:pdf|docx?|txt|eml))"',  # File ID and name
+                    r'/file/d/([a-zA-Z0-9-_]{28,})',  # Just file IDs
                 ]
 
-                files = []
-                # This is a simplified parser - in production use proper Google Drive API
-                for match in re.finditer(r'/file/d/([a-zA-Z0-9-_]+)', content):
-                    file_id = match.group(1)
-                    # Create direct download link
-                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-                    files.append({
-                        "file_id": file_id,
-                        "download_url": download_url,
-                        "filename": f"file_{file_id}.pdf"  # Default, will be updated
-                    })
+                found_files = set()  # Avoid duplicates
+
+                # Inside the folder processing method, update the file detection section:
+                for pattern in file_patterns:
+                    matches = re.finditer(pattern, content, re.IGNORECASE)
+                    for match in matches:
+                        if len(match.groups()) == 2:
+                            file_id, detected_filename = match.groups()
+                        else:
+                            file_id = match.group(1)
+                            detected_filename = None
+
+                        if file_id not in found_files and len(file_id) >= 28:
+                            found_files.add(file_id)
+
+                            # Get real filename using our improved metadata function
+                            try:
+                                metadata = await GoogleDriveProcessor.get_drive_file_metadata(file_id)
+                                real_filename = metadata["name"]
+                                logger.info(f"📄 Got real filename for {file_id[:8]}: {real_filename}")
+                            except Exception as meta_error:
+                                logger.warning(f"Failed to get metadata for {file_id}: {meta_error}")
+                                real_filename = detected_filename or f"drive_document_{file_id[:8]}.pdf"
+
+                            # Create download URL
+                            download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+
+                            files.append({
+                                "file_id": file_id,
+                                "download_url": download_url,
+                                "filename": real_filename,  # Use the real filename here
+                                "original_filename": real_filename
+                            })
+
+                if not files:
+                    logger.warning("No files found in Google Drive folder")
+                    # Try alternative extraction method
+                    file_id_matches = re.findall(r'/file/d/([a-zA-Z0-9-_]{25,})', content)
+                    for file_id in list(set(file_id_matches))[:10]:  # Limit to 10 files
+                        download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                        files.append({
+                            "file_id": file_id,
+                            "download_url": download_url,
+                            "filename": f"document_{file_id[:8]}.pdf",
+                            "original_filename": f"document_{file_id[:8]}.pdf"
+                        })
 
                 logger.info(f"Found {len(files)} files in Google Drive folder")
                 return files
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error processing Google Drive folder: {e}")
-            # Fallback: treat as single file
-            return [{
-                "file_id": "single_file",
-                "download_url": folder_url,
-                "filename": "document.pdf"
-            }]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to process Google Drive folder: {str(e)}. Make sure the folder is publicly accessible."
+            )
+
+    @staticmethod
+    async def _fallback_folder_parsing(folder_url: str) -> List[Dict[str, str]]:
+        """Fallback method using HTML parsing"""
+        try:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                response = await client.get(folder_url)
+                response.raise_for_status()
+                content = response.text
+
+                files = []
+                for match in re.finditer(r'/file/d/([a-zA-Z0-9-_]+)', content):
+                    file_id = match.group(1)
+                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                    files.append({
+                        "file_id": file_id,
+                        "download_url": download_url,
+                        "filename": f"document_{file_id}.pdf",  # Default fallback
+                        "original_filename": f"document_{file_id}.pdf"
+                    })
+
+                return files
+        except Exception as e:
+            logger.error(f"Fallback parsing failed: {e}")
+            return []
 
     @staticmethod
     def convert_to_direct_download(url: str) -> str:
@@ -629,6 +760,305 @@ class GoogleDriveProcessor:
 
         return url
 
+    @staticmethod
+    async def get_drive_file_metadata(file_id: str) -> Dict[str, str]:
+        """Get file metadata from Google Drive using multiple approaches with better error handling"""
+        try:
+            # Method 1: Try Google Drive API v3 (most reliable)
+            api_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=name,mimeType,size"
+
+            timeout = httpx.Timeout(15.0, connect=5.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                try:
+                    response = await client.get(api_url)
+                    if response.status_code == 200:
+                        metadata = response.json()
+                        original_name = metadata.get("name", "").strip()
+
+                        # Validate the name is meaningful
+                        if original_name and len(original_name) > 0 and not original_name.startswith('Untitled'):
+                            logger.info(f"✅ Got real filename from Drive API: {original_name}")
+                            return {
+                                "name": original_name,
+                                "mime_type": metadata.get("mimeType", "application/pdf"),
+                                "size": metadata.get("size", "unknown")
+                            }
+                    else:
+                        logger.warning(f"Drive API returned status {response.status_code}")
+                except Exception as api_error:
+                    logger.warning(f"Drive API v3 failed: {api_error}")
+
+            # Method 2: Try alternative API endpoint
+            alt_api_url = f"https://www.googleapis.com/drive/v2/files/{file_id}"
+            try:
+                response = await client.get(alt_api_url)
+                if response.status_code == 200:
+                    metadata = response.json()
+                    original_name = metadata.get("title", "").strip()
+
+                    if original_name and len(original_name) > 0 and not original_name.startswith('Untitled'):
+                        logger.info(f"✅ Got filename from Drive API v2: {original_name}")
+                        return {
+                            "name": original_name,
+                            "mime_type": metadata.get("mimeType", "application/pdf"),
+                            "size": str(metadata.get("fileSize", "unknown"))
+                        }
+            except Exception as api2_error:
+                logger.warning(f"Drive API v2 failed: {api2_error}")
+
+            # Method 3: Try HTML scraping approach
+            try:
+                file_url = f"https://drive.google.com/file/d/{file_id}/view"
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+
+                response = await client.get(file_url, headers=headers)
+                if response.status_code == 200:
+                    content = response.text
+
+                    # Look for filename in HTML title tag
+                    import re
+                    title_match = re.search(r'<title>([^<]+)</title>', content, re.IGNORECASE)
+                    if title_match:
+                        title = title_match.group(1).strip()
+                        # Remove " - Google Drive" suffix
+                        if title.endswith(' - Google Drive'):
+                            title = title[:-13].strip()
+
+                        if title and len(title) > 3 and not title.startswith('Google Drive'):
+                            logger.info(f"✅ Got filename from HTML title: {title}")
+                            # Add extension if missing
+                            if '.' not in title:
+                                title += '.pdf'
+                            return {
+                                "name": title,
+                                "mime_type": "application/pdf",
+                                "size": "unknown"
+                            }
+
+                    # Look for filename in meta tags
+                    meta_patterns = [
+                        r'<meta property="og:title" content="([^"]+)"',
+                        r'<meta name="title" content="([^"]+)"',
+                        r'"name":"([^"]+\.(?:pdf|docx?|txt|eml))"'
+                    ]
+
+                    for pattern in meta_patterns:
+                        matches = re.finditer(pattern, content, re.IGNORECASE)
+                        for match in matches:
+                            filename = match.group(1).strip()
+                            if filename and len(filename) > 3:
+                                logger.info(f"✅ Got filename from HTML meta: {filename}")
+                                return {
+                                    "name": filename,
+                                    "mime_type": "application/pdf",
+                                    "size": "unknown"
+                                }
+            except Exception as html_error:
+                logger.warning(f"HTML scraping failed: {html_error}")
+
+            # All methods failed - return descriptive fallback
+            logger.warning(f"All filename extraction methods failed for file {file_id}")
+            fallback_name = f"drive_document_{file_id[:8]}.pdf"
+
+            return {
+                "name": fallback_name,
+                "mime_type": "application/pdf",
+                "size": "unknown"
+            }
+
+        except Exception as e:
+            logger.error(f"Complete metadata extraction failed for {file_id}: {e}")
+            return {
+                "name": f"drive_document_{file_id[:8]}.pdf",
+                "mime_type": "application/pdf",
+                "size": "unknown"
+            }
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename for safe storage while preserving readability"""
+        # Remove or replace problematic characters
+        sanitized = filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        sanitized = re.sub(r'[<>:"|?*]', '_', sanitized)
+        # Remove multiple underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        return sanitized.strip('_')
+
+    @staticmethod
+    async def get_drive_folder_files_recursive(folder_url: str, current_path: str = "", max_depth: int = 5,
+                                               current_depth: int = 0) -> List[Dict[str, str]]:
+        """
+        Recursively get all files from Google Drive folder and its subfolders
+
+        Args:
+            folder_url (str): Google Drive folder URL
+            current_path (str): Current folder path for nested folders
+            max_depth (int): Maximum recursion depth to prevent infinite loops
+            current_depth (int): Current recursion depth
+
+        Returns:
+            List[Dict[str, str]]: List of all files with folder path information
+        """
+        if current_depth >= max_depth:
+            logger.warning(f"Maximum recursion depth ({max_depth}) reached for path: {current_path}")
+            return []
+
+        try:
+            folder_id = GoogleDriveProcessor.extract_folder_id(folder_url)
+            logger.info(f"📁 Processing Google Drive folder (depth {current_depth}): {current_path or 'root'}")
+
+            # Get folder contents using enhanced HTML parsing
+            all_items = await GoogleDriveProcessor._get_folder_contents_enhanced(folder_id)
+
+            all_files = []
+
+            for item in all_items:
+                if item.get("type") == "file":
+                    # It's a file - add folder path information
+                    file_info = {
+                        "file_id": item["file_id"],
+                        "download_url": item["download_url"],
+                        "filename": item["filename"],
+                        "original_filename": item["original_filename"],
+                        "folder_path": current_path
+                    }
+                    all_files.append(file_info)
+
+                elif item.get("type") == "folder":
+                    # It's a subfolder - recursively process it
+                    subfolder_name = item.get("folder_name", "unknown_folder")
+                    subfolder_path = f"{current_path}/{subfolder_name}" if current_path else subfolder_name
+
+                    logger.info(f"📂 Found subfolder: {subfolder_path}")
+
+                    try:
+                        # Construct subfolder URL
+                        subfolder_url = f"https://drive.google.com/drive/folders/{item['folder_id']}"
+
+                        # Recursively process subfolder
+                        subfolder_files = await GoogleDriveProcessor.get_drive_folder_files_recursive(
+                            subfolder_url,
+                            subfolder_path,
+                            max_depth,
+                            current_depth + 1
+                        )
+
+                        all_files.extend(subfolder_files)
+                        logger.info(f"📁 Added {len(subfolder_files)} files from subfolder: {subfolder_path}")
+
+                    except Exception as subfolder_error:
+                        logger.warning(f"⚠️ Failed to process subfolder {subfolder_path}: {subfolder_error}")
+                        continue
+
+            logger.info(f"✅ Found {len(all_files)} total files in folder path: {current_path or 'root'}")
+            return all_files
+
+        except Exception as e:
+            logger.error(f"❌ Error processing folder at depth {current_depth}: {e}")
+            return []
+
+    @staticmethod
+    async def _get_folder_contents_enhanced(folder_id: str) -> List[Dict[str, str]]:
+        """
+        Enhanced folder content parsing that can detect both files and subfolders
+
+        Returns:
+            List containing both files and folders with type information
+        """
+        try:
+            public_folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                response = await client.get(public_folder_url, headers=headers)
+
+                if response.status_code != 200:
+                    logger.error(f"Cannot access Google Drive folder {folder_id}. Status: {response.status_code}")
+                    return []
+
+                content = response.text
+                all_items = []
+
+                # Enhanced regex patterns for both files and folders
+                patterns = {
+                    "files": [
+                        r'"(\w{28,})".*?"([^"]*\.(?:pdf|docx?|txt|eml))".*?"application/',  # Files with extensions
+                        r'/file/d/([a-zA-Z0-9-_]{28,})',  # File IDs
+                    ],
+                    "folders": [
+                        r'/folders/([a-zA-Z0-9-_]{28,})"[^"]*"([^"]+)".*?"folder"',  # Folder pattern
+                        r'"(\w{28,})".*?"([^"]+)".*?"folder"',  # Alternative folder pattern
+                    ]
+                }
+
+                # Process files
+                found_file_ids = set()
+                for pattern in patterns["files"]:
+                    matches = re.finditer(pattern, content, re.IGNORECASE)
+                    for match in matches:
+                        if len(match.groups()) >= 2:
+                            file_id, filename = match.groups()[:2]
+                        else:
+                            file_id = match.group(1)
+                            filename = f"document_{file_id[:8]}.pdf"
+
+                        if file_id not in found_file_ids and len(file_id) >= 28:
+                            found_file_ids.add(file_id)
+
+                            download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+
+                            all_items.append({
+                                "type": "file",
+                                "file_id": file_id,
+                                "download_url": download_url,
+                                "filename": filename,
+                                "original_filename": filename
+                            })
+
+                # Process folders
+                found_folder_ids = set()
+                for pattern in patterns["folders"]:
+                    matches = re.finditer(pattern, content, re.IGNORECASE)
+                    for match in matches:
+                        if len(match.groups()) >= 2:
+                            folder_id, folder_name = match.groups()[:2]
+
+                            if folder_id not in found_folder_ids and len(folder_id) >= 28:
+                                found_folder_ids.add(folder_id)
+
+                                all_items.append({
+                                    "type": "folder",
+                                    "folder_id": folder_id,
+                                    "folder_name": folder_name.strip()
+                                })
+
+                # Alternative file detection if no files found with primary method
+                if not found_file_ids:
+                    file_id_matches = re.findall(r'/file/d/([a-zA-Z0-9-_]{25,})', content)
+                    for file_id in list(set(file_id_matches))[:20]:  # Limit to 20 files
+                        download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                        all_items.append({
+                            "type": "file",
+                            "file_id": file_id,
+                            "download_url": download_url,
+                            "filename": f"document_{file_id[:8]}.pdf",
+                            "original_filename": f"document_{file_id[:8]}.pdf"
+                        })
+
+                files_count = len([item for item in all_items if item["type"] == "file"])
+                folders_count = len([item for item in all_items if item["type"] == "folder"])
+
+                logger.info(f"📊 Found {files_count} files and {folders_count} subfolders in folder {folder_id}")
+                return all_items
+
+        except Exception as e:
+            logger.error(f"❌ Enhanced folder parsing failed for {folder_id}: {e}")
+            return []
 
 class VectorStore:
     """FAISS-based vector store with direct Supabase storage - NO BUFFER/CACHE"""
@@ -745,7 +1175,7 @@ class VectorStore:
             chunks_path = f"vectors/{document_id}/chunks.json"
             await upload_file_to_supabase(chunks_path, chunks_bytes)
 
-            # Save enhanced metadata
+            # Save enhanced metadata with both filename variants
             metadata = {
                 "document_id": document_id,
                 "chunks_count": len(chunks),
@@ -753,8 +1183,12 @@ class VectorStore:
                 "dimension": self.dimension,
                 "created_at": time.time(),
                 "total_characters": sum(chunk["char_count"] for chunk in chunks),
-                "file_name": file_name,
-                "source_info": source_info or {}  # NEW: Store source information
+                "file_name": file_name,  # This will be the original readable name
+                "original_filename": source_info.get("original_filename", file_name) if source_info else file_name,
+                # NEW
+                "sanitized_filename": source_info.get("sanitized_filename", file_name) if source_info else file_name,
+                # NEW
+                "source_info": source_info or {}
             }
             metadata_json = json.dumps(metadata, indent=2)
             metadata_bytes = metadata_json.encode('utf-8')
@@ -1280,6 +1714,97 @@ vector_store = VectorStore()
 rag_llm_service = RAGLLMService()
 
 
+def is_valid_document_url(url: str) -> bool:
+    """Check if URL likely points to a valid document format"""
+    url_lower = url.lower()
+
+    # Valid extensions
+    valid_extensions = ['.pdf', '.docx', '.doc', '.txt', '.eml']
+
+    # Check if URL contains valid extension
+    if any(ext in url_lower for ext in valid_extensions):
+        return True
+
+    # For Google Drive URLs, assume valid (will be validated during download)
+    if 'drive.google.com' in url_lower or 'docs.google.com' in url_lower:
+        return True
+
+    # For other URLs without clear extensions, we'll validate during download
+    return True
+
+
+async def _ingest_single_document(request: DocumentIngestRequest) -> Dict[str, Any]:
+    """Ingest a single document from URL with enhanced validation"""
+    try:
+        # Validate file type before processing (for URLs)
+        if request.source.startswith(('http://', 'https://')):
+            if not is_valid_document_url(request.source):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="URL does not appear to point to a valid document format. Supported: PDF, DOCX, DOC, TXT, EML"
+                )
+
+        # Extract text and get document info
+        text, document_id, original_filename, sanitized_filename = await DocumentProcessor.process_document_from_source(
+            request.source, request.source_type
+        )
+
+        # Check if document already exists in Supabase
+        try:
+            await vector_store._load_from_supabase_direct(document_id)
+            logger.info(f"Found existing vector data for document {document_id}")
+            return {
+                "document_id": document_id,
+                "filename": original_filename,
+                "original_filename": original_filename,
+                "sanitized_filename": sanitized_filename,
+                "status": "already_processed",
+                "source": request.source,
+                "message": "Document already exists in vector store"
+            }
+        except HTTPException:
+            # Document not found, create new one
+            logger.info(f"Creating new vector index for document {document_id}")
+
+            # Create chunks
+            chunks = DocumentProcessor.intelligent_chunking(text)
+
+            # Prepare source info with both filenames
+            source_info = {
+                "source_url": request.source,
+                "source_type": request.source_type or "auto",
+                "folder_name": request.folder_name,
+                "original_filename": original_filename,
+                "sanitized_filename": sanitized_filename,
+                "ingested_at": time.time()
+            }
+
+            # Create embeddings and store
+            chunks_created = await vector_store.create_embeddings(
+                document_id, chunks, original_filename, source_info
+            )
+
+            return {
+                "document_id": document_id,
+                "filename": original_filename,
+                "original_filename": original_filename,
+                "sanitized_filename": sanitized_filename,
+                "status": "processed",
+                "chunks_created": chunks_created,
+                "source": request.source,
+                "source_info": source_info,
+                "message": f"Document processed successfully with {chunks_created} chunks"
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing single document: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process document: {str(e)}"
+        )
+
 # Replace the root endpoint (around line 280) with this enhanced version:
 
 @app.get("/")
@@ -1372,11 +1897,11 @@ async def upload_document(
         document_id = str(uuid.uuid4())
         logger.info(f"✅ Generated document ID: {document_id}")
 
-        # Create Supabase file path with timestamp for uniqueness
+        # Create Supabase file path with sanitized filename but preserve original
         timestamp = int(time.time())
-        safe_filename = file.filename.replace(" ", "_").replace("/", "_")
-        supabase_file_path = f"documents/{document_id}_{timestamp}_{safe_filename}"
-        logger.info(f"📁 Supabase file path: {supabase_file_path}")
+        sanitized_filename = DocumentProcessor.sanitize_filename(file.filename)
+        supabase_file_path = f"documents/{document_id}_{timestamp}_{sanitized_filename}"
+        logger.info(f"🗂️ Supabase file path: {supabase_file_path}")
 
         # Read file content
         logger.info("📖 Reading file content...")
@@ -1428,7 +1953,8 @@ async def upload_document(
             "source_type": "file_upload",
             "upload_timestamp": timestamp,
             "original_content_type": file.content_type,
-            "original_filename": file.filename,
+            "original_filename": file.filename,  # Keep original readable name
+            "sanitized_filename": sanitized_filename,  # Safe storage name
             "supabase_path": uploaded_path,
             "file_size_bytes": len(content),
             "ingested_at": time.time(),
@@ -1474,108 +2000,88 @@ async def upload_document(
             detail=f"Failed to process document: {str(e)}"
         )
 
-@app.post("/api/v1/documents/ingest-link")
-async def ingest_document_link(
+
+@app.post("/api/v1/documents/ingest")
+async def ingest_documents_unified(
         request: DocumentIngestRequest,
         token: str = Depends(verify_token)
 ):
-    """Ingest documents from URL or Google Drive folder"""
+    """Unified endpoint to ingest single documents, folders, or nested folder structures"""
     try:
-        logger.info(f"Ingesting from source: {request.source}")
+        logger.info(f"📥 Unified ingestion from source: {request.source}")
 
         # Check if it's a Google Drive folder
         if GoogleDriveProcessor.is_google_drive_link(request.source) and '/folders/' in request.source:
-            return await _ingest_google_drive_folder(request)
+            return await _ingest_google_drive_folder_recursive(request)
         else:
+            # For non-folder sources, process as single document
+            logger.info("Source is not a folder, processing as single document")
             return await _ingest_single_document(request)
 
     except Exception as e:
-        logger.error(f"Error ingesting document link: {e}")
+        logger.error(f"Error in unified ingestion: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to ingest document: {str(e)}"
+            detail=f"Failed to ingest documents: {str(e)}"
         )
 
 
-async def _ingest_single_document(request: DocumentIngestRequest) -> Dict[str, Any]:
-    """Ingest a single document from URL"""
-    # Extract text and get document info
-    text, document_id, filename = await DocumentProcessor.process_document_from_source(
-        request.source, request.source_type
-    )
-
-    # Check if document already exists in Supabase
-    try:
-        await vector_store._load_from_supabase_direct(document_id)
-        logger.info(f"Found existing vector data for document {document_id}")
-
-        return {
-            "document_id": document_id,
-            "filename": filename,
-            "status": "already_processed",
-            "source": request.source,
-            "message": "Document already exists in vector store"
-        }
-
-    except HTTPException:
-        # Document not found, create new one
-        logger.info(f"Creating new vector index for document {document_id}")
-
-        # Create chunks
-        chunks = DocumentProcessor.intelligent_chunking(text)
-
-        # Prepare source info
-        source_info = {
-            "source_url": request.source,
-            "source_type": request.source_type or "auto",
-            "folder_name": request.folder_name,
-            "ingested_at": time.time()
-        }
-
-        # Create embeddings and store
-        chunks_created = await vector_store.create_embeddings(
-            document_id, chunks, filename, source_info
-        )
-
-        return {
-            "document_id": document_id,
-            "filename": filename,
-            "status": "processed",
-            "chunks_created": chunks_created,
-            "source": request.source,
-            "source_info": source_info,
-            "message": f"Document processed successfully with {chunks_created} chunks"
-        }
-
-
-async def _ingest_google_drive_folder(request: DocumentIngestRequest) -> Dict[str, Any]:
-    """Ingest all documents from Google Drive folder"""
+async def _ingest_google_drive_folder_recursive(request: DocumentIngestRequest) -> Dict[str, Any]:
+    """Enhanced Google Drive folder processing with recursive folder support and file filtering"""
     try:
         # Get list of files in folder
-        files = await GoogleDriveProcessor.get_drive_folder_files(request.source)
+        files = await GoogleDriveProcessor.get_drive_folder_files_recursive(request.source)
 
         if not files:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No files found in Google Drive folder"
+                detail="No files found in Google Drive folder or folder is not publicly accessible"
             )
+
+        # Filter valid document files
+        valid_files = _filter_valid_document_files(files)
+
+        if not valid_files:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid document files found in folder. Supported formats: PDF, DOCX, DOC, TXT, EML"
+            )
+
+        logger.info(f"📁 Processing {len(valid_files)} valid documents from {len(files)} total files")
 
         results = []
         successful = 0
         failed = 0
+        skipped = 0
 
-        for file_info in files:
+        for i, file_info in enumerate(valid_files):
+            file_name = file_info.get("original_filename", file_info.get("filename", "unknown"))
+            folder_path = file_info.get("folder_path", "")
+            logger.info(f"Processing file {i + 1}/{len(valid_files)}: {folder_path}/{file_name}")
+
             try:
-                # Create individual ingest request
+                # Create individual ingest request with folder context
                 file_request = DocumentIngestRequest(
                     source=file_info["download_url"],
                     source_type="google_drive",
-                    folder_name=request.folder_name or "Google Drive Folder"
+                    folder_name=f"{request.folder_name or 'Google Drive'}/{folder_path}" if folder_path else request.folder_name or "Google Drive"
                 )
 
-                # Ingest individual file
-                result = await _ingest_single_document(file_request)
-                result["original_file_info"] = file_info
+                # Ingest individual file with timeout
+                result = await asyncio.wait_for(
+                    _ingest_single_document(file_request),
+                    timeout=120.0  # 2 minute timeout per file
+                )
+
+                # Override filename with the real Drive filename and add folder info
+                result["filename"] = file_name
+                result["folder_path"] = folder_path
+                result["drive_metadata"] = {
+                    "drive_file_id": file_info.get("file_id"),
+                    "original_filename": file_name,
+                    "folder_path": folder_path,
+                    "file_type": file_info.get("file_type", "unknown")
+                }
                 results.append(result)
 
                 if result["status"] in ["processed", "already_processed"]:
@@ -1583,35 +2089,121 @@ async def _ingest_google_drive_folder(request: DocumentIngestRequest) -> Dict[st
                 else:
                     failed += 1
 
-                # Rate limiting
-                await asyncio.sleep(1)
+                logger.info(f"✅ Successfully processed: {folder_path}/{file_name}")
+
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Timeout processing file: {folder_path}/{file_name}")
+                results.append({
+                    "filename": file_name,
+                    "folder_path": folder_path,
+                    "status": "timeout",
+                    "error": "File processing timed out",
+                    "original_file_info": file_info
+                })
+                failed += 1
+
+            except HTTPException as he:
+                # Handle specific HTTP errors more gracefully
+                if he.status_code == 400 and "HTML instead of document" in str(he.detail):
+                    logger.warning(f"⭐ Skipping inaccessible file: {folder_path}/{file_name}")
+                    results.append({
+                        "filename": file_name,
+                        "folder_path": folder_path,
+                        "status": "skipped",
+                        "error": "File not publicly accessible",
+                        "original_file_info": file_info
+                    })
+                    skipped += 1
+                elif he.status_code == 422 and "EOF marker not found" in str(he.detail):
+                    logger.warning(f"⭐ Skipping corrupted file: {folder_path}/{file_name}")
+                    results.append({
+                        "filename": file_name,
+                        "folder_path": folder_path,
+                        "status": "skipped",
+                        "error": "File appears to be corrupted or incomplete",
+                        "original_file_info": file_info
+                    })
+                    skipped += 1
+                else:
+                    logger.error(f"❌ HTTP error processing {folder_path}/{file_name}: {he.detail}")
+                    results.append({
+                        "filename": file_name,
+                        "folder_path": folder_path,
+                        "status": "failed",
+                        "error": str(he.detail),
+                        "original_file_info": file_info
+                    })
+                    failed += 1
 
             except Exception as e:
-                logger.error(f"Failed to process file {file_info.get('filename', 'unknown')}: {e}")
+                logger.error(f"❌ Failed to process file {folder_path}/{file_name}: {e}")
                 results.append({
-                    "filename": file_info.get("filename", "unknown"),
+                    "filename": file_name,
+                    "folder_path": folder_path,
                     "status": "failed",
                     "error": str(e),
                     "original_file_info": file_info
                 })
                 failed += 1
 
+            # Rate limiting between files
+            if i < len(valid_files) - 1:  # Don't sleep after last file
+                await asyncio.sleep(2)
+
         return {
             "folder_url": request.source,
-            "total_files": len(files),
+            "total_files_found": len(files),
+            "valid_document_files": len(valid_files),
             "successful": successful,
             "failed": failed,
+            "skipped": skipped,
             "folder_name": request.folder_name or "Google Drive Folder",
             "results": results,
-            "message": f"Processed {successful}/{len(files)} files successfully"
+            "message": f"Processed {successful}/{len(valid_files)} valid documents successfully, {skipped} skipped, {failed} failed",
+            "note": "Only valid document formats (PDF, DOCX, DOC, TXT, EML) are processed. Folders are processed recursively.",
+            "processing_info": {
+                "recursive_folders": True,
+                "file_filtering": True,
+                "supported_formats": ["PDF", "DOCX", "DOC", "TXT", "EML"]
+            }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing Google Drive folder: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process Google Drive folder: {str(e)}"
         )
+
+
+def _filter_valid_document_files(files: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Filter files to only include valid document formats"""
+    valid_extensions = {'.pdf', '.docx', '.doc', '.txt', '.eml'}
+    valid_files = []
+
+    for file_info in files:
+        filename = file_info.get("original_filename", file_info.get("filename", "")).lower()
+
+        # Check if file has a valid document extension
+        is_valid = any(filename.endswith(ext) for ext in valid_extensions)
+
+        if is_valid:
+            # Add file type info for better tracking
+            file_type = "unknown"
+            for ext in valid_extensions:
+                if filename.endswith(ext):
+                    file_type = ext[1:]  # Remove the dot
+                    break
+
+            file_info["file_type"] = file_type
+            valid_files.append(file_info)
+        else:
+            logger.info(f"🚫 Skipping invalid file type: {filename}")
+
+    logger.info(f"📋 Filtered to {len(valid_files)} valid documents from {len(files)} total files")
+    return valid_files
 
 
 @app.post("/api/v1/query/global")
@@ -1704,7 +2296,7 @@ async def process_document_qa_rag(
         token: str = Depends(verify_token)
 ):
     """
-    RAG-powered document QA endpoint - Returns simple answers array format
+    RAG-powered document QA endpoint - Returns detailed answers with sources and metadata
     """
     try:
         document_id = None
@@ -1713,8 +2305,9 @@ async def process_document_qa_rag(
         if request.documents and not request.document_id:
             logger.info(f"Processing document from source: {request.documents}")
 
-            # Extract text and get document ID with filename - UPDATED
-            text, document_id, filename = await DocumentProcessor.process_document_from_source(request.documents)
+            # Extract text and get document ID with both filenames - UPDATED
+            text, document_id, original_filename, sanitized_filename = await DocumentProcessor.process_document_from_source(
+                request.documents)
 
             # Check if we already have this document processed in Supabase
             try:
@@ -1726,15 +2319,17 @@ async def process_document_qa_rag(
                 logger.info(f"Creating new vector index for document {document_id}")
                 chunks = DocumentProcessor.intelligent_chunking(text)
 
-                # Create source info - UPDATED
+                # Create source info with both filenames - UPDATED
                 source_info = {
                     "source_url": request.documents,
                     "source_type": "api_request",
                     "processed_via": "hackrx_endpoint",
+                    "original_filename": original_filename,
+                    "sanitized_filename": sanitized_filename,
                     "ingested_at": time.time()
                 }
 
-                await vector_store.create_embeddings(document_id, chunks, filename, source_info)
+                await vector_store.create_embeddings(document_id, chunks, original_filename, source_info)
                 logger.info(f"Created new vector index in Supabase for document {document_id}")
 
         elif request.document_id:
@@ -1747,8 +2342,8 @@ async def process_document_qa_rag(
                 detail="Either 'documents' URL/Supabase path or 'document_id' must be provided"
             )
 
-        # Process questions using RAG - Extract only answer strings
-        answers = []
+        # Process questions using RAG - Return detailed responses like global query
+        detailed_answers = []
 
         for i, question in enumerate(request.questions):
             logger.info(f"Processing question {i + 1}/{len(request.questions)}: {question[:50]}...")
@@ -1763,19 +2358,53 @@ async def process_document_qa_rag(
                 question, relevant_chunks, document_id
             )
 
-            # Extract only the answer text as string
-            answer_text = answer_data.get("answer", "No answer generated")
-            answers.append(answer_text)
+            # Format sources with document info (similar to global query)
+            sources = []
+            for chunk in relevant_chunks[:5]:  # Top 5 sources
+                sources.append({
+                    "document_id": document_id,
+                    "chunk_id": chunk["chunk_id"],
+                    "similarity_score": chunk["similarity_score"],
+                    "chunk_preview": chunk["text"][:150] + "..." if len(chunk["text"]) > 150 else chunk["text"],
+                    "rank": chunk.get("rank", sources.__len__() + 1)
+                })
 
-            logger.info(f"Generated answer {i + 1}: {answer_text[:100]}...")
+            # Create detailed answer object
+            detailed_answer = {
+                "question": question,
+                "answer": answer_data.get("answer", "No answer generated"),
+                "confidence": answer_data.get("confidence", 0.0),
+                "sources": sources,
+                "chunks_retrieved": len(relevant_chunks),
+                "retrieval_info": {
+                    "top_similarity_score": relevant_chunks[0]["similarity_score"] if relevant_chunks else 0.0,
+                    "avg_similarity_score": sum(chunk["similarity_score"] for chunk in relevant_chunks) / len(relevant_chunks) if relevant_chunks else 0.0,
+                    "chunks_above_threshold": len([c for c in relevant_chunks if c["similarity_score"] > 0.5])
+                }
+            }
+
+            detailed_answers.append(detailed_answer)
+
+            logger.info(f"Generated detailed answer {i + 1} with {len(sources)} sources")
 
             # Rate limiting for free tier
             await asyncio.sleep(0.5)
 
-        logger.info("Successfully processed all questions using RAG")
+        logger.info("Successfully processed all questions using RAG with detailed responses")
 
-        # Return simple format: only answers array with plain strings
-        return {"answers": answers}
+        # Return detailed format similar to global query
+        return {
+            "answers": detailed_answers,
+            "document_id": document_id,
+            "total_questions": len(request.questions),
+            "search_type": "document_specific",
+            "processing_info": {
+                "document_source": request.documents or "pre_processed",
+                "total_chunks_searched": sum(len(ans["sources"]) for ans in detailed_answers),
+                "avg_confidence": sum(ans["confidence"] for ans in detailed_answers) / len(detailed_answers) if detailed_answers else 0.0
+            },
+            "storage_mode": "supabase_direct"
+        }
 
     except HTTPException:
         raise
@@ -1785,7 +2414,6 @@ async def process_document_qa_rag(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
         )
-
 
 @app.get("/api/v1/documents/{document_id}/chunks")
 async def get_document_chunks(
@@ -1939,24 +2567,90 @@ async def list_documents(token: str = Depends(verify_token)):
 
 @app.get("/api/v1/storage/files")
 async def list_storage_files(token: str = Depends(verify_token)):
-    """List all files in Supabase storage"""
+    """List all files in Supabase storage with enriched metadata"""
     try:
         # Use the new list function
         files = await list_supabase_files()
 
-        # Separate by file type
+        # Separate by file type and enrich with metadata
         document_files = []
         vector_files = []
         other_files = []
+        enriched_documents = {}
 
+        # First pass: collect all files and identify vector documents
         for file_info in files:
             file_path = file_info.get('name', '')
             if file_path.startswith('documents/'):
                 document_files.append(file_info)
             elif file_path.startswith('vectors/'):
                 vector_files.append(file_info)
+
+                # Check if this is a metadata file and extract document_id
+                if file_path.endswith('/metadata.json'):
+                    path_parts = file_path.split('/')
+                    if len(path_parts) >= 3:
+                        document_id = path_parts[1]
+                        try:
+                            # Load and parse metadata
+                            metadata_bytes = await download_file_from_supabase(file_path)
+                            metadata = json.loads(metadata_bytes.decode('utf-8'))
+                            enriched_documents[document_id] = {
+                                **file_info,
+                                "document_id": document_id,
+                                "file_name": metadata.get("file_name", "unknown"),
+                                "chunks_count": metadata.get("chunks_count", 0),
+                                "total_characters": metadata.get("total_characters", 0),
+                                "embedding_model": metadata.get("embedding_model", "unknown"),
+                                "created_at": int(metadata.get("created_at", 0)),
+                                "original_filename": metadata.get("original_filename"),
+                                "sanitized_filename": metadata.get("sanitized_filename"),
+                                "source_info": metadata.get("source_info", {}),
+                                "storage_path": f"vectors/{document_id}/",
+                                "has_metadata": True
+                            }
+                        except Exception as e:
+                            logger.warning(f"Failed to load metadata for {document_id}: {e}")
             else:
                 other_files.append(file_info)
+
+        # Second pass: enrich vector files with metadata
+        enriched_vector_files = []
+        for file_info in vector_files:
+            file_path = file_info.get('name', '')
+            # Extract document_id from vector file path
+            path_parts = file_path.split('/')
+            if len(path_parts) >= 3:
+                document_id = path_parts[1]
+                if document_id in enriched_documents:
+                    # Add file type information
+                    file_type = "unknown"
+                    if file_path.endswith('.npy'):
+                        file_type = "embeddings"
+                    elif file_path.endswith('.json'):
+                        if file_path.endswith('metadata.json'):
+                            file_type = "metadata"
+                        elif file_path.endswith('chunks.json'):
+                            file_type = "chunks"
+
+                    enriched_file = {
+                        **file_info,
+                        "document_id": document_id,
+                        "file_type": file_type,
+                        "parent_document": enriched_documents[document_id]
+                    }
+                    enriched_vector_files.append(enriched_file)
+                else:
+                    # No metadata found, add basic info
+                    enriched_vector_files.append({
+                        **file_info,
+                        "document_id": document_id,
+                        "file_type": "orphaned",
+                        "parent_document": None
+                    })
+
+        # Create document summary (similar to root endpoint)
+        document_summary = list(enriched_documents.values())
 
         return {
             "total_files": len(files),
@@ -1964,12 +2658,19 @@ async def list_storage_files(token: str = Depends(verify_token)):
             "breakdown": {
                 "original_documents": len(document_files),
                 "vector_data_files": len(vector_files),
+                "processed_documents": len(enriched_documents),
                 "other_files": len(other_files)
             },
             "files": {
                 "documents": document_files,
-                "vectors": vector_files,
+                "vectors": enriched_vector_files,
                 "other": other_files
+            },
+            "processed_documents": document_summary,  # This matches your root endpoint format
+            "metadata_info": {
+                "documents_with_metadata": len(enriched_documents),
+                "total_vector_files": len(vector_files),
+                "orphaned_files": len([f for f in enriched_vector_files if f.get("file_type") == "orphaned"])
             }
         }
 

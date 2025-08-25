@@ -292,29 +292,89 @@ async def list_supabase_files(prefix: str = "") -> List[Dict[str, Any]]:
     manager = get_supabase_manager()
     return await manager.list_files(prefix)
 
+
 async def download_document_content(source: str) -> Tuple[bytes, str]:
-    """Download document content from URL or Supabase"""
+    """Download document content from URL or Supabase with content validation"""
     logger.info(f"📥 Downloading from: {source}")
 
     try:
         if source.startswith(('http://', 'https://')):
-            # URL source
-            timeout = httpx.Timeout(30.0, connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            # URL source - Enhanced for Google Drive
+            timeout = httpx.Timeout(60.0, connect=15.0)  # Longer timeout for Drive
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
                 response = await client.get(source)
                 response.raise_for_status()
-                return response.content, 'url'
+
+                content = response.content
+                content_type = response.headers.get('content-type', '').lower()
+
+                # Validate content is not HTML (common for Drive access issues)
+                if content_type.startswith('text/html') or b'<!DOCTYPE html>' in content[:1000]:
+                    logger.error(f"Received HTML instead of document content from {source}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Failed to download file: received HTML instead of document. File may not be publicly accessible."
+                    )
+
+                # Validate minimum file size
+                if len(content) < 100:
+                    logger.error(f"Downloaded content too small: {len(content)} bytes")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Downloaded file too small ({len(content)} bytes). File may be inaccessible."
+                    )
+
+                # Validate content type for common document formats
+                if not _is_valid_document_content(content, content_type):
+                    logger.error(f"Invalid document content detected. Content-Type: {content_type}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Downloaded content is not a valid document format."
+                    )
+
+                return content, 'url'
         else:
             # Supabase path
             content = await download_file_from_supabase(source)
             return content, 'supabase'
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Download failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to download: {str(e)}"
         )
+
+
+def _is_valid_document_content(content: bytes, content_type: str) -> bool:
+    """Validate if content is a valid document format"""
+    if not content or len(content) < 10:
+        return False
+
+    # Check file signatures
+    if content.startswith(b'%PDF'):
+        return True
+    elif content.startswith(b'PK'):  # ZIP-based formats (DOCX, etc.)
+        return True
+    elif content_type and any(doc_type in content_type for doc_type in [
+        'application/pdf', 'application/msword', 'application/vnd.openxml', 'text/plain'
+    ]):
+        return True
+    elif b'From:' in content[:1000] or b'Subject:' in content[:1000]:  # Email
+        return True
+
+    # Check for HTML content (invalid)
+    html_indicators = [b'<!DOCTYPE', b'<html', b'<HTML', b'<body', b'<BODY']
+    if any(indicator in content[:1000] for indicator in html_indicators):
+        return False
+
+    return True
 
 async def test_supabase_upload_standalone():
     """Test function to verify Supabase upload works"""
