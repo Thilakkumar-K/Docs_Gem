@@ -651,15 +651,28 @@ class GoogleDriveProcessor:
                 # Look for file patterns in the HTML
                 import re
 
-                # Pattern for file data in Drive's HTML
+                # Improved patterns that avoid API keys and other false positives
                 file_patterns = [
-                    r'"(\w{28,})".*?"([^"]*\.(?:pdf|docx?|txt|eml))"',  # File ID and name
-                    r'/file/d/([a-zA-Z0-9-_]{28,})',  # Just file IDs
+                    r'"([a-zA-Z0-9-_]{25,50})".*?"([^"]*\.(?:pdf|docx?|txt|eml))"',  # File ID and name
+                    r'/file/d/([a-zA-Z0-9-_]{25,50})(?:/|")',  # Just file IDs from URLs
                 ]
 
                 found_files = set()  # Avoid duplicates
 
-                # Inside the folder processing method, update the file detection section:
+                def is_valid_drive_file_id(file_id):
+                    """Validate that this looks like a real Drive file ID, not an API key"""
+                    # Google API keys start with 'AIza' - exclude these
+                    if file_id.startswith('AIza'):
+                        return False
+                    # Drive file IDs are typically 25-50 chars, alphanumeric with - and _
+                    if not (25 <= len(file_id) <= 50):
+                        return False
+                    # Should contain mix of letters and numbers (API keys are more structured)
+                    has_letters = any(c.isalpha() for c in file_id)
+                    has_numbers = any(c.isdigit() for c in file_id)
+                    return has_letters and has_numbers
+
+                # Process file patterns with validation
                 for pattern in file_patterns:
                     matches = re.finditer(pattern, content, re.IGNORECASE)
                     for match in matches:
@@ -669,7 +682,8 @@ class GoogleDriveProcessor:
                             file_id = match.group(1)
                             detected_filename = None
 
-                        if file_id not in found_files and len(file_id) >= 28:
+                        # Validate the file ID before processing
+                        if file_id not in found_files and is_valid_drive_file_id(file_id):
                             found_files.add(file_id)
 
                             # Get real filename using our improved metadata function
@@ -693,16 +707,18 @@ class GoogleDriveProcessor:
 
                 if not files:
                     logger.warning("No files found in Google Drive folder")
-                    # Try alternative extraction method
-                    file_id_matches = re.findall(r'/file/d/([a-zA-Z0-9-_]{25,})', content)
+                    # Try alternative extraction method with validation
+                    file_id_matches = re.findall(r'/file/d/([a-zA-Z0-9-_]{25,50})(?:/|")', content)
                     for file_id in list(set(file_id_matches))[:10]:  # Limit to 10 files
-                        download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-                        files.append({
-                            "file_id": file_id,
-                            "download_url": download_url,
-                            "filename": f"document_{file_id[:8]}.pdf",
-                            "original_filename": f"document_{file_id[:8]}.pdf"
-                        })
+                        # Only process if it's a valid Drive file ID
+                        if is_valid_drive_file_id(file_id):
+                            download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                            files.append({
+                                "file_id": file_id,
+                                "download_url": download_url,
+                                "filename": f"document_{file_id[:8]}.pdf",
+                                "original_filename": f"document_{file_id[:8]}.pdf"
+                            })
 
                 logger.info(f"Found {len(files)} files in Google Drive folder")
                 return files
